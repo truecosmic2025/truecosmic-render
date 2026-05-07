@@ -1,0 +1,17 @@
+{
+  "name": "truecosmic-ken-burns-render",
+  "version": "1.0.0",
+  "description": "FFmpeg Ken Burns render server for TrueCosmic hybrid pipeline",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "express": "^4.19.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "node-fetch": "^2.7.0"
+  }
+}
