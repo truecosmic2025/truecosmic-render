@@ -11,6 +11,7 @@
  * Required env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
  * Requires `ffmpeg` binary in the container (Railway nixpacks: add `ffmpeg`).
  */
+
 const express = require("express");
 const fs = require("fs");
 const os = require("os");
@@ -18,13 +19,27 @@ const path = require("path");
 const { spawn } = require("child_process");
 const fetch = require("node-fetch");
 const { createClient } = require("@supabase/supabase-js");
+
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+
 app.get("/", (_req, res) => res.json({ ok: true, service: "truecosmic-ken-burns" }));
 
+/**
+ * FFmpeg zoompan filters per effect.
+ * d=125 = 5 seconds at 25fps. We override `d` based on requested duration.
+ */
 function buildZoompan(effect, durationSec) {
   const d = Math.max(1, Math.round(durationSec * 25));
   switch (effect) {
@@ -63,17 +78,24 @@ app.post("/ken-burns", async (req, res) => {
   if (!image_url || !output_filename || !effect) {
     return res.status(400).json({ error: "image_url, output_filename, effect required" });
   }
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kb-"));
-  const inExt = (image_url.split("?")[0].split(".").pop() || "jpg").toLowerCase();
+  const cleanUrl = image_url.split("?")[0];
+  const lastSeg = cleanUrl.substring(cleanUrl.lastIndexOf("/") + 1);
+  const extMatch = lastSeg.match(/\.([a-zA-Z0-9]{1,5})$/);
+  const inExt = (extMatch ? extMatch[1] : "jpg").toLowerCase();
   const inPath = path.join(tmpDir, `in.${inExt}`);
   const outPath = path.join(tmpDir, `out.mp4`);
+
   try {
     const dl = await fetch(image_url);
     if (!dl.ok) throw new Error(`Image download failed (${dl.status})`);
     const buf = Buffer.from(await dl.arrayBuffer());
     fs.writeFileSync(inPath, buf);
+
     const dur = Math.max(1, parseInt(duration, 10) || 10);
     const zoompan = buildZoompan(effect, dur);
+
     await runFfmpeg([
       "-y",
       "-loop", "1",
@@ -88,11 +110,13 @@ app.post("/ken-burns", async (req, res) => {
       "-movflags", "+faststart",
       outPath,
     ]);
+
     const outBuf = fs.readFileSync(outPath);
     const { error: upErr } = await supabase.storage
       .from("generated-clips")
       .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
     if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
+
     const { data: pub } = supabase.storage.from("generated-clips").getPublicUrl(output_filename);
     res.json({ ok: true, clip_url: pub.publicUrl });
   } catch (e) {
