@@ -8,7 +8,9 @@
  * Downloads the image, applies an FFmpeg zoompan filter, outputs 1920x1080 @ 25fps,
  * uploads to the Supabase `generated-clips` bucket and returns { clip_url }.
  *
- * Required env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * Required env for upload endpoints: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * `/stitch-final` can run without Supabase credentials when called with
+ * `{ return_binary: true }`; the caller uploads the returned MP4 itself.
  * Requires `ffmpeg` binary in the container or the bundled `ffmpeg-static` binary.
  */
 
@@ -49,12 +51,18 @@ function resolveFfmpegBinary() {
   return "ffmpeg";
 }
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-  process.exit(1);
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+} else {
+  console.warn("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing; upload endpoints are disabled, but /stitch-final binary mode will still work.");
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+function assertStorageConfigured() {
+  if (!supabase) {
+    throw new Error("Storage upload is not configured on this render server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, or use /stitch-final with return_binary=true.");
+  }
+}
 
 // Robust download: retries with backoff and a per-attempt timeout so
 // transient 504s / slow Supabase Storage responses don't kill the render.
@@ -82,13 +90,13 @@ async function downloadWithRetry(url, { attempts = 4, timeoutMs = 45000 } = {}) 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "truecosmic-ken-burns", version: RENDER_SERVER_VERSION, ffmpeg: FFMPEG_BIN }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "truecosmic-ken-burns", version: RENDER_SERVER_VERSION, ffmpeg: FFMPEG_BIN, storage_uploads: Boolean(supabase) }));
 app.get("/health", async (_req, res) => {
   try {
     const version = await ffmpegVersion();
-    res.json({ ok: true, service: "truecosmic-ken-burns", server_version: RENDER_SERVER_VERSION, ffmpeg: FFMPEG_BIN, ffmpeg_version: version });
+    res.json({ ok: true, service: "truecosmic-ken-burns", server_version: RENDER_SERVER_VERSION, ffmpeg: FFMPEG_BIN, ffmpeg_version: version, storage_uploads: Boolean(supabase) });
   } catch (e) {
-    res.status(503).json({ ok: false, service: "truecosmic-ken-burns", server_version: RENDER_SERVER_VERSION, ffmpeg: FFMPEG_BIN, error: e.message });
+    res.status(503).json({ ok: false, service: "truecosmic-ken-burns", server_version: RENDER_SERVER_VERSION, ffmpeg: FFMPEG_BIN, storage_uploads: Boolean(supabase), error: e.message });
   }
 });
 
@@ -147,10 +155,11 @@ function runFfmpeg(args) {
 }
 
 app.post("/ken-burns", async (req, res) => {
-  const { image_url, duration = 10, output_filename, effect, music_url, music_volume = 0.15 } = req.body || {};
-  if (!image_url || !output_filename || !effect) {
-    return res.status(400).json({ error: "image_url, output_filename, effect required" });
+  const { image_url, duration = 10, output_filename, effect, music_url, music_volume = 0.15, return_binary = false } = req.body || {};
+  if (!image_url || !effect || (!return_binary && !output_filename)) {
+    return res.status(400).json({ error: "image_url, effect, and output_filename required unless return_binary=true" });
   }
+  let binaryResponseInProgress = false;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kb-"));
   const cleanUrl = image_url.split("?")[0];
@@ -202,6 +211,14 @@ app.post("/ken-burns", async (req, res) => {
     args.push(outPath);
     await runFfmpeg(args);
 
+    if (return_binary) {
+      binaryResponseInProgress = true;
+      return res.sendFile(outPath, { headers: { "Content-Type": "video/mp4" } }, () => {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      });
+    }
+
+    assertStorageConfigured();
     const outBuf = fs.readFileSync(outPath);
     const { error: upErr } = await supabase.storage
       .from("generated-clips")
@@ -214,6 +231,7 @@ app.post("/ken-burns", async (req, res) => {
     console.error(e);
     res.status(500).json({ error: e.message || "render failed" });
   } finally {
+    if (binaryResponseInProgress) return;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
@@ -225,10 +243,11 @@ app.post("/ken-burns", async (req, res) => {
  * uploads the result to the `final-videos` bucket.
  */
 app.post("/mix-audio", async (req, res) => {
-  const { video_url, narration_url, music_url, music_volume = 0.15, output_filename, sound_effects = [] } = req.body || {};
-  if (!video_url || !output_filename) {
-    return res.status(400).json({ error: "video_url and output_filename required" });
+  const { video_url, narration_url, music_url, music_volume = 0.15, output_filename, sound_effects = [], return_binary = false } = req.body || {};
+  if (!video_url || (!return_binary && !output_filename)) {
+    return res.status(400).json({ error: "video_url and output_filename required unless return_binary=true" });
   }
+  let binaryResponseInProgress = false;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mix-"));
   const videoPath = path.join(tmpDir, "video.mp4");
@@ -311,6 +330,14 @@ app.post("/mix-audio", async (req, res) => {
     args.push("-movflags", "+faststart", outPath);
     await runFfmpeg(args);
 
+    if (return_binary) {
+      binaryResponseInProgress = true;
+      return res.sendFile(outPath, { headers: { "Content-Type": "video/mp4" } }, () => {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      });
+    }
+
+    assertStorageConfigured();
     const outBuf = fs.readFileSync(outPath);
     const { error: upErr } = await supabase.storage
       .from("final-videos")
@@ -322,6 +349,7 @@ app.post("/mix-audio", async (req, res) => {
     console.error(e);
     res.status(500).json({ error: e.message || "mix failed" });
   } finally {
+    if (binaryResponseInProgress) return;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
@@ -337,10 +365,11 @@ app.post("/mix-audio", async (req, res) => {
  * to the `final-videos` bucket. Returns { video_url }.
  */
 app.post("/stitch-final", async (req, res) => {
-  const { clip_urls, output_filename, target_aspect = "16:9" } = req.body || {};
-  if (!Array.isArray(clip_urls) || clip_urls.length === 0 || !output_filename) {
-    return res.status(400).json({ error: "clip_urls (non-empty array) and output_filename required" });
+  const { clip_urls, output_filename, target_aspect = "16:9", return_binary = false } = req.body || {};
+  if (!Array.isArray(clip_urls) || clip_urls.length === 0 || (!return_binary && !output_filename)) {
+    return res.status(400).json({ error: "clip_urls (non-empty array) and output_filename required unless return_binary=true" });
   }
+  let binaryResponseInProgress = false;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "stitch-"));
   const outPath = path.join(tmpDir, "final.mp4");
@@ -391,6 +420,15 @@ app.post("/stitch-final", async (req, res) => {
     ];
     await runFfmpeg(args);
 
+    if (return_binary) {
+      binaryResponseInProgress = true;
+      res.setHeader("X-Clip-Count", String(n));
+      return res.sendFile(outPath, { headers: { "Content-Type": "video/mp4" } }, () => {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      });
+    }
+
+    assertStorageConfigured();
     const outBuf = fs.readFileSync(outPath);
     const { error: upErr } = await supabase.storage
       .from("final-videos")
@@ -402,6 +440,7 @@ app.post("/stitch-final", async (req, res) => {
     console.error("stitch-final error", e);
     res.status(500).json({ error: e.message || "stitch failed" });
   } finally {
+    if (binaryResponseInProgress) return;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
