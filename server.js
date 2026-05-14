@@ -34,6 +34,8 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const RENDER_SERVER_VERSION = "2026-05-14-subtle-ken-burns";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
+const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
+const CAPTIONS_HIGHLIGHT_BGR = process.env.CAPTIONS_HIGHLIGHT_BGR || "FF309B"; // #9B30FF (BBGGRR)
 
 function resolveFfmpegBinary() {
   const candidates = [
@@ -503,6 +505,161 @@ app.post("/mix-audio", async (req, res) => {
  * Concatenates every clip/part in order, then mixes narration (front), sound
  * effects (medium), and soundtrack (low) into the final MP4.
  */
+/* ===========================================================
+ * AssemblyAI karaoke caption helpers
+ * =========================================================== */
+function formatAssTime(t) {
+  if (!isFinite(t) || t < 0) t = 0;
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = Math.floor(t % 60);
+  const cs = Math.floor((t - Math.floor(t)) * 100);
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+}
+
+function escapeAssText(t) {
+  return String(t).replace(/\\/g, "\\\\").replace(/\{/g, "\\{").replace(/\}/g, "\\}").replace(/\n/g, " ");
+}
+
+/**
+ * Group AssemblyAI words into chunks of <= maxWords (≈ max 2 lines on screen).
+ */
+function chunkWords(words, maxWords = 7) {
+  const chunks = [];
+  for (let i = 0; i < words.length; i += maxWords) chunks.push(words.slice(i, i + maxWords));
+  return chunks;
+}
+
+/**
+ * Build an ASS subtitle file with karaoke-style word-by-word highlighting.
+ * Highlighted word = purple (#9B30FF), rest = white. Large bold centered.
+ */
+function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIGHT_BGR }) {
+  const fontSize = Math.round(height * 0.07); // ~75 on 1080p, ~134 on 1920 portrait
+  const marginV = Math.round(height * 0.12);
+  const header = [
+    "[Script Info]",
+    "ScriptType: v4.00+",
+    "WrapStyle: 2",
+    "ScaledBorderAndShadow: yes",
+    `PlayResX: ${width}`,
+    `PlayResY: ${height}`,
+    "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    `Style: Karaoke,Arial Black,${fontSize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,4,3,2,80,80,${marginV},1`,
+    "",
+    "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+  ];
+
+  const events = [];
+  const chunks = chunkWords(words, 7);
+  for (const chunk of chunks) {
+    if (chunk.length === 0) continue;
+    const chunkStart = chunk[0].start / 1000;
+    const chunkEnd = chunk[chunk.length - 1].end / 1000;
+    for (let i = 0; i < chunk.length; i++) {
+      const w = chunk[i];
+      const wStart = w.start / 1000;
+      const wEnd = i + 1 < chunk.length ? chunk[i + 1].start / 1000 : chunkEnd;
+      const text = chunk
+        .map((cw, j) => {
+          const t = escapeAssText(cw.text);
+          if (j === i) return `{\\c&H${highlightBgr}&}${t}{\\c&HFFFFFF&}`;
+          return t;
+        })
+        .join(" ");
+      events.push(
+        `Dialogue: 0,${formatAssTime(wStart)},${formatAssTime(wEnd)},Karaoke,,0,0,0,,${text}`
+      );
+    }
+    // Hold the last word colour briefly until chunkEnd if needed
+    if (chunk.length > 0) {
+      const lastWordEnd = chunk[chunk.length - 1].end / 1000;
+      if (lastWordEnd > chunkEnd) {
+        // no-op, capped above
+      }
+    }
+  }
+
+  return header.concat(events).join("\n") + "\n";
+}
+
+/**
+ * Upload audio to AssemblyAI and request a transcript with word timestamps.
+ * Returns the words array (each: { text, start, end }) or [] on failure.
+ */
+async function transcribeWithAssemblyAi(audioPath) {
+  if (!ASSEMBLYAI_API_KEY) {
+    console.warn("ASSEMBLYAI_API_KEY not set; skipping captions.");
+    return [];
+  }
+  try {
+    const audioBuf = fs.readFileSync(audioPath);
+    const upRes = await fetch("https://api.assemblyai.com/v2/upload", {
+      method: "POST",
+      headers: { authorization: ASSEMBLYAI_API_KEY, "content-type": "application/octet-stream" },
+      body: audioBuf,
+    });
+    if (!upRes.ok) throw new Error(`AssemblyAI upload ${upRes.status}: ${(await upRes.text()).slice(0, 200)}`);
+    const upJson = await upRes.json();
+    const audio_url = upJson.upload_url;
+
+    const trRes = await fetch("https://api.assemblyai.com/v2/transcript", {
+      method: "POST",
+      headers: { authorization: ASSEMBLYAI_API_KEY, "content-type": "application/json" },
+      body: JSON.stringify({ audio_url, punctuate: true, format_text: true }),
+    });
+    if (!trRes.ok) throw new Error(`AssemblyAI submit ${trRes.status}: ${(await trRes.text()).slice(0, 200)}`);
+    const trJson = await trRes.json();
+    const transcriptId = trJson.id;
+
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const pollRes = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
+        headers: { authorization: ASSEMBLYAI_API_KEY },
+      });
+      if (!pollRes.ok) continue;
+      const pollJson = await pollRes.json();
+      if (pollJson.status === "completed") {
+        return Array.isArray(pollJson.words) ? pollJson.words : [];
+      }
+      if (pollJson.status === "error") {
+        throw new Error(`AssemblyAI transcript error: ${pollJson.error}`);
+      }
+    }
+    throw new Error("AssemblyAI transcript timed out");
+  } catch (e) {
+    console.warn("AssemblyAI captioning failed:", e.message);
+    return [];
+  }
+}
+
+/**
+ * Burn karaoke ASS captions into a video file. Replaces destPath atomically.
+ * Returns true on success, false on failure (caller keeps original file).
+ */
+async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
+  // ffmpeg subtitles filter needs the path escaped (commas, colons).
+  const escaped = assPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
+  const args = [
+    "-y",
+    "-i", srcPath,
+    "-vf", `subtitles=filename='${escaped}'`,
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "20",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    destPath,
+  ];
+  await runFfmpeg(args);
+  return true;
+}
+
 app.post("/stitch-final", async (req, res) => {
   const body = req.body || {};
   const { output_filename, target_aspect = "16:9", return_binary = false } = body;
@@ -714,25 +871,52 @@ app.post("/stitch-final", async (req, res) => {
     ];
     await runFfmpeg(args);
 
+    // ===== Karaoke caption burn-in (AssemblyAI) =====
+    // Runs after audio mixing so we transcribe the actual narration track.
+    // Gracefully no-ops if ASSEMBLYAI_API_KEY is missing or transcription fails.
+    let captionedPath = outPath;
+    try {
+      if (ASSEMBLYAI_API_KEY && hasAudio) {
+        const audioOnly = path.join(tmpDir, "final-audio.m4a");
+        await runFfmpeg(["-y", "-i", outPath, "-vn", "-c:a", "aac", "-b:a", "128k", audioOnly]);
+        const words = await transcribeWithAssemblyAi(audioOnly);
+        if (words.length > 0) {
+          const ass = buildKaraokeAss(words, { width: W, height: H });
+          const assPath = path.join(tmpDir, "captions.ass");
+          fs.writeFileSync(assPath, ass, "utf8");
+          const burnedPath = path.join(tmpDir, "final-captioned.mp4");
+          await burnCaptionsIntoVideo(outPath, burnedPath, assPath);
+          captionedPath = burnedPath;
+          console.log(`Burned ${words.length} karaoke captions into final video.`);
+        } else {
+          console.warn("AssemblyAI returned no words; shipping uncaptioned video.");
+        }
+      }
+    } catch (e) {
+      console.warn("Caption burn-in failed, shipping uncaptioned video:", e.message);
+      captionedPath = outPath;
+    }
+
     if (return_binary) {
       binaryResponseInProgress = true;
       res.setHeader("X-Clip-Count", String(n));
       res.setHeader("X-Narration-Count", String(narrationPaths.length));
       res.setHeader("X-Sfx-Count", String(sfxPaths.length));
       res.setHeader("X-Has-Music", musicPath ? "true" : "false");
-      return res.sendFile(outPath, { headers: { "Content-Type": "video/mp4" } }, () => {
+      res.setHeader("X-Captions", captionedPath !== outPath ? "burned" : "none");
+      return res.sendFile(captionedPath, { headers: { "Content-Type": "video/mp4" } }, () => {
         try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       });
     }
 
     assertStorageConfigured();
-    const outBuf = fs.readFileSync(outPath);
+    const outBuf = fs.readFileSync(captionedPath);
     const { error: upErr } = await supabase.storage
       .from("final-videos")
       .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
     if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
     const { data: pub } = supabase.storage.from("final-videos").getPublicUrl(output_filename);
-    res.json({ ok: true, video_url: pub.publicUrl, clip_count: n, narration_count: narrationPaths.length, sfx_count: sfxPaths.length, has_music: Boolean(musicPath) });
+    res.json({ ok: true, video_url: pub.publicUrl, clip_count: n, narration_count: narrationPaths.length, sfx_count: sfxPaths.length, has_music: Boolean(musicPath), captions: captionedPath !== outPath ? "burned" : "none" });
   } catch (e) {
     console.error("stitch-final error", e);
     res.status(500).json({ error: e.message || "stitch failed" });
@@ -742,4 +926,4 @@ app.post("/stitch-final", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`render server on ${PORT} (ffmpeg=${FFMPEG_BIN}, ffprobe=${FFPROBE_BIN}, version=${RENDER_SERVER_VERSION})`));
+app.listen(PORT, () => console.log(`Ken Burns render server listening on :${PORT}; ffmpeg=${FFMPEG_BIN}`));
