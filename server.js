@@ -391,7 +391,13 @@ app.post("/stitch-final", async (req, res) => {
     // because the source clips come from different providers (Kling, Veo,
     // Ken Burns) with different resolutions/codecs/audio tracks.
     const inputs = [];
-    for (const p of localPaths) inputs.push("-i", p);
+    for (const p of localPaths) {
+      inputs.push(
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
+        "-i", p,
+      );
+    }
 
     const n = localPaths.length;
     const parts = [];
@@ -416,6 +422,7 @@ app.post("/stitch-final", async (req, res) => {
       "-r", "25",
       "-pix_fmt", "yuv420p",
       "-movflags", "+faststart",
+      "-max_muxing_queue_size", "1024",
       outPath,
     ];
     await runFfmpeg(args);
