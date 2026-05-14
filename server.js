@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-14-weighted-narration-sync";
+const RENDER_SERVER_VERSION = "2026-05-14-subtle-ken-burns";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 
@@ -94,6 +94,7 @@ async function downloadWithRetry(url, { attempts = 4, timeoutMs = 45000 } = {}) 
       clearTimeout(t);
       if (r.ok) return Buffer.from(await r.arrayBuffer());
       lastErr = new Error(`Image download failed (${r.status})`);
+      // Retry on 5xx and 408/429
       if (![408, 429, 500, 502, 503, 504].includes(r.status)) throw lastErr;
     } catch (e) {
       clearTimeout(t);
@@ -140,17 +141,20 @@ function buildZoompan(effect, durationSec) {
   const d = Math.max(1, Math.round(durationSec * 25));
   switch (effect) {
     case "zoom-in":
-      return `zoompan=z='min(zoom+0.0015,1.5)':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      // Slower, gentler push-in. Caps at 1.15x so framing stays close to the original.
+      return `zoompan=z='min(zoom+0.0006,1.15)':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
     case "zoom-out":
-      return `zoompan=z='if(lte(zoom,1.0),1.5,max(1.001,zoom-0.0015))':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      // Start slightly zoomed-in (1.15x) and ease back to 1.0x for a calm reveal.
+      return `zoompan=z='if(lte(zoom,1.0),1.15,max(1.0,zoom-0.0006))':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
     case "pan-left":
-      return `zoompan=z='1.2':d=${d}:x='iw/4+(iw/4*(on/${d}))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      // Gentle horizontal pan at a lighter 1.1x crop.
+      return `zoompan=z='1.1':d=${d}:x='iw/3+(iw/6*(on/${d}))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
     case "pan-right":
-      return `zoompan=z='1.2':d=${d}:x='iw-(iw/4+(iw/4*(on/${d})))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      return `zoompan=z='1.1':d=${d}:x='iw-(iw/3+(iw/6*(on/${d})))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
     case "diagonal":
-      return `zoompan=z='min(zoom+0.001,1.3)':d=${d}:x='iw/4*(on/${d})':y='ih/4*(on/${d})':s=1920x1080:fps=25`;
+      return `zoompan=z='min(zoom+0.0005,1.12)':d=${d}:x='iw/8*(on/${d})':y='ih/8*(on/${d})':s=1920x1080:fps=25`;
     case "zoom-drift":
-      return `zoompan=z='min(zoom+0.002,1.6)':d=${d}:x='iw/2-(iw/zoom/2)+(20*(on/${d}))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      return `zoompan=z='min(zoom+0.0008,1.18)':d=${d}:x='iw/2-(iw/zoom/2)+(10*(on/${d}))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
     default:
       throw new Error(`Unknown effect: ${effect}`);
   }
@@ -367,6 +371,9 @@ app.post("/ken-burns", async (req, res) => {
 
 /**
  * POST /mix-audio
+ * Body: { video_url, narration_url, music_url, music_volume=0.15, output_filename }
+ * Mixes the narration (primary) and music (background) into the final video and
+ * uploads the result to the `final-videos` bucket.
  */
 app.post("/mix-audio", async (req, res) => {
   const { video_url, narration_url, music_url, music_volume = 0.15, output_filename, sound_effects = [], return_binary = false } = req.body || {};
@@ -392,6 +399,7 @@ app.post("/mix-audio", async (req, res) => {
     if (narration_url) { try { await dl(narration_url, narrPath); hasNarr = true; } catch (e) { console.warn("narr fetch", e.message); } }
     if (music_url) { try { await dl(music_url, musicPath); hasMusic = true; } catch (e) { console.warn("music fetch", e.message); } }
 
+    // Download sound effects (optional)
     const sfxList = [];
     if (Array.isArray(sound_effects)) {
       for (let i = 0; i < sound_effects.length; i++) {
@@ -413,6 +421,8 @@ app.post("/mix-audio", async (req, res) => {
     if (hasMusic) args.push("-i", musicPath);
     for (const s of sfxList) args.push("-i", s.path);
 
+    // Build audio mix graph dynamically.
+    // Input indices: 0=video, then narration (if any), then music (if any), then sfx in order.
     let inputIdx = 1;
     const mixLabels = [];
     const filterParts = [];
@@ -438,6 +448,7 @@ app.post("/mix-audio", async (req, res) => {
       filter = filterParts.join(";") + `;${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=first:dropout_transition=2:normalize=0[aout]`;
       mapAudio = "[aout]";
     } else if (mixLabels.length === 1) {
+      // Rename the sole label to [aout]
       const sole = mixLabels[0];
       filter = filterParts.join(";").replace(sole, "[aout]");
       mapAudio = "[aout]";
@@ -479,10 +490,18 @@ app.post("/mix-audio", async (req, res) => {
 /**
  * POST /stitch-final
  * Body: {
- *   clip_urls, narrations?, sound_effects?, music_url?, music_volume?,
- *   clip_durations?, clip_duration_weights?,
- *   output_filename, target_aspect?, return_binary?
+ *   clip_urls: string[] | nested clips,  // ordered MP4 URLs; nested part arrays are flattened
+ *   narrations?: string[] | { audio_url/url }[],
+ *   sound_effects?: { audio_url/url/sound_effect_url, timestamp_seconds, volume }[],
+ *   music_url?: string,                  // background soundtrack
+ *   music_volume?: number,               // default 0.15
+ *   clip_durations?: number[],            // optional per-clip target seconds
+ *   clip_duration_weights?: number[],     // optional per-clip weights, scaled to narration length
+ *   output_filename: string,             // path inside the `final-videos` bucket
+ *   target_aspect?: "16:9"|"9:16"       // default 16:9
  * }
+ * Concatenates every clip/part in order, then mixes narration (front), sound
+ * effects (medium), and soundtrack (low) into the final MP4.
  */
 app.post("/stitch-final", async (req, res) => {
   const body = req.body || {};
@@ -500,6 +519,9 @@ app.post("/stitch-final", async (req, res) => {
   const H = isPortrait ? 1920 : 1080;
 
   try {
+    // Download all video parts in parallel (with retry). Nested arrays/objects
+    // were flattened above, so long scripts split into part 1/2/3 are stitched
+    // into one final video in the exact incoming order.
     const localPaths = await Promise.all(clipUrls.map(async (url, i) => {
       const dest = path.join(tmpDir, `clip-${String(i).padStart(4, "0")}.mp4`);
       await downloadToFile(url, dest, `clip ${i + 1}`);
@@ -523,6 +545,8 @@ app.post("/stitch-final", async (req, res) => {
     }
 
     const soundtrackUrl = body.music_url || body.soundtrack_url;
+    // Clamp soundtrack to a safe ceiling so narration stays dominant
+    // even if the project stored an overly loud music_volume.
     const musicVolume = clampNumber(body.music_volume, 0.12, 0, 0.15);
     let musicPath = null;
     if (soundtrackUrl) {
@@ -549,6 +573,7 @@ app.post("/stitch-final", async (req, res) => {
           sfxPaths.push({
             path: dest,
             timestamp: Math.max(0, Number(sfx.timestamp_seconds) || 0),
+            // SFX should sit below narration: cap at 0.4 with a 0.35 default.
             volume: clampNumber(sfx.volume, 0.35, 0, 0.4),
           });
         } catch (e) {
@@ -563,6 +588,9 @@ app.post("/stitch-final", async (req, res) => {
     const requestedClipDurations = normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
     const requestedClipWeights = normalizeDurationList(body.clip_duration_weights || body.scene_duration_weights || body.duration_weights);
 
+    // Per-scene image/narration sync: when we receive one narration per clip
+    // (matching scene order), retime each clip to exactly its narration's
+    // duration so images stay on screen as long as the voice over plays.
     const perSceneSync =
       narrationPaths.length === localPaths.length &&
       narrationPaths.length > 1 &&
@@ -599,6 +627,10 @@ app.post("/stitch-final", async (req, res) => {
     const finalDuration = Math.max(1, baseTotalDuration, narrationDuration, maxSfxEnd);
     const videoPadDuration = Math.max(0, finalDuration - baseTotalDuration);
 
+    // Build a filter_complex that scales/pads every input to a uniform size,
+    // forces 25fps, then concatenates. This is safer than -f concat demuxer
+    // because the source clips come from different providers (Kling, Veo,
+    // Ken Burns) with different resolutions/codecs/audio tracks.
     const inputs = [];
     for (const p of localPaths) {
       inputs.push(
@@ -620,6 +652,9 @@ app.post("/stitch-final", async (req, res) => {
       const target = clipTargetDurations[i];
       const srcDur = durations[i] || target;
       const pad = Math.max(0, target - srcDur);
+      // Scale + pad to the target frame, then extend (clone last frame) or
+      // trim to the narration-matched duration so each image holds for as
+      // long as its narration line plays.
       parts.push(
         `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
         `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p,` +
@@ -707,4 +742,4 @@ app.post("/stitch-final", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Ken Burns render server listening on :${PORT}; ffmpeg=${FFMPEG_BIN}`));
+app.listen(PORT, () => console.log(`render server on ${PORT} (ffmpeg=${FFMPEG_BIN}, ffprobe=${FFPROBE_BIN}, version=${RENDER_SERVER_VERSION})`));
