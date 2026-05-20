@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-stable-stitch-captions-fallback";
+const RENDER_SERVER_VERSION = "2026-05-20-verify-caption-burn-v2";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -662,7 +662,7 @@ async function transcribeWithAssemblyAi(audioPath) {
     const trRes = await fetch("https://api.assemblyai.com/v2/transcript", {
       method: "POST",
       headers: { authorization: ASSEMBLYAI_API_KEY, "content-type": "application/json" },
-      body: JSON.stringify({ audio_url, punctuate: true, format_text: true }),
+      body: JSON.stringify({ audio_url, punctuate: true, format_text: true, speech_model: "universal-2" }),
     });
     if (!trRes.ok) throw new Error(`AssemblyAI submit ${trRes.status}: ${(await trRes.text()).slice(0, 200)}`);
     const trJson = await trRes.json();
@@ -969,30 +969,45 @@ app.post("/stitch-final", async (req, res) => {
       await runFfmpeg(["-y", "-i", videoForMixPath, "-c", "copy", "-movflags", "+faststart", outPath]);
     }
 
-    // ===== Karaoke caption burn-in (AssemblyAI) =====
-    // Runs after audio mixing so we transcribe the actual narration track.
-    // Gracefully no-ops if ASSEMBLYAI_API_KEY is missing or transcription fails.
+    // ===== Karaoke caption burn-in =====
+    // Prefer AssemblyAI word timings when available, but ALWAYS fall back to
+    // the scene narration/script text supplied by the app. This prevents the
+    // server from silently shipping an uncaptioned final video when AssemblyAI
+    // is missing, returns no words, or fails.
     let captionedPath = outPath;
+    let captionSource = "none";
     try {
+      const captionItems = normalizeCaptionItems(
+        body.captions || body.caption_items || body.captionItems || body.scene_captions || body.scenes
+      );
+      let words = [];
       if (ASSEMBLYAI_API_KEY && hasAudio) {
         const audioOnly = path.join(tmpDir, "final-audio.m4a");
         await runFfmpeg(["-y", "-i", outPath, "-vn", "-c:a", "aac", "-b:a", "128k", audioOnly]);
-        const words = await transcribeWithAssemblyAi(audioOnly);
-        if (words.length > 0) {
-          const ass = buildKaraokeAss(words, { width: W, height: H });
-          const assPath = path.join(tmpDir, "captions.ass");
-          fs.writeFileSync(assPath, ass, "utf8");
-          const burnedPath = path.join(tmpDir, "final-captioned.mp4");
-          await burnCaptionsIntoVideo(outPath, burnedPath, assPath);
-          captionedPath = burnedPath;
-          console.log(`Burned ${words.length} karaoke captions into final video.`);
-        } else {
-          console.warn("AssemblyAI returned no words; shipping uncaptioned video.");
-        }
+        words = await transcribeWithAssemblyAi(audioOnly);
+        if (words.length > 0) captionSource = "assemblyai";
+      }
+
+      if (words.length === 0 && captionItems.length > 0) {
+        words = buildCaptionWordsFromSceneText(captionItems, clipTargetDurations);
+        if (words.length > 0) captionSource = "scene-text";
+      }
+
+      if (words.length > 0) {
+        const ass = buildKaraokeAss(words, { width: W, height: H });
+        const assPath = path.join(tmpDir, "captions.ass");
+        fs.writeFileSync(assPath, ass, "utf8");
+        const burnedPath = path.join(tmpDir, "final-captioned.mp4");
+        await burnCaptionsIntoVideo(outPath, burnedPath, assPath);
+        captionedPath = burnedPath;
+        console.log(`Burned ${words.length} karaoke captions into final video via ${captionSource}.`);
+      } else {
+        console.warn("No caption words were available from AssemblyAI or scene text; shipping uncaptioned video.");
       }
     } catch (e) {
       console.warn("Caption burn-in failed, shipping uncaptioned video:", e.message);
       captionedPath = outPath;
+      captionSource = "failed";
     }
 
     if (return_binary) {
@@ -1001,7 +1016,7 @@ app.post("/stitch-final", async (req, res) => {
       res.setHeader("X-Narration-Count", String(narrationPaths.length));
       res.setHeader("X-Sfx-Count", String(sfxPaths.length));
       res.setHeader("X-Has-Music", musicPath ? "true" : "false");
-      res.setHeader("X-Captions", captionedPath !== outPath ? "burned" : "none");
+      res.setHeader("X-Captions", captionedPath !== outPath ? `burned:${captionSource}` : captionSource);
       return res.sendFile(captionedPath, { headers: { "Content-Type": "video/mp4" } }, () => {
         try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       });
@@ -1014,7 +1029,7 @@ app.post("/stitch-final", async (req, res) => {
       .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
     if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
     const { data: pub } = supabase.storage.from("final-videos").getPublicUrl(output_filename);
-    res.json({ ok: true, video_url: pub.publicUrl, clip_count: n, narration_count: narrationPaths.length, sfx_count: sfxPaths.length, has_music: Boolean(musicPath), captions: captionedPath !== outPath ? "burned" : "none" });
+    res.json({ ok: true, video_url: pub.publicUrl, clip_count: n, narration_count: narrationPaths.length, sfx_count: sfxPaths.length, has_music: Boolean(musicPath), captions: captionedPath !== outPath ? `burned:${captionSource}` : captionSource });
   } catch (e) {
     console.error("stitch-final error", e);
     res.status(500).json({ error: e.message || "stitch failed" });
