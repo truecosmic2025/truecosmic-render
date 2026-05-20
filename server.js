@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-14-subtle-ken-burns";
+const RENDER_SERVER_VERSION = "2026-05-20-stable-stitch-normalize";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -162,15 +162,28 @@ function buildZoompan(effect, durationSec) {
   }
 }
 
-function runFfmpeg(args) {
+function runFfmpeg(args, { timeoutMs = Number(process.env.FFMPEG_TIMEOUT_MS || 10 * 60 * 1000) } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(FFMPEG_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGKILL"); } catch {}
+      reject(new Error(`ffmpeg timed out after ${Math.round(timeoutMs / 1000)}s: ${stderr.slice(-1000)}`));
+    }, timeoutMs);
     proc.stderr.on("data", (d) => { stderr += d.toString(); });
     proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       reject(new Error(`Failed to start ffmpeg at ${FFMPEG_BIN}: ${err.message}`));
     });
     proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-1000)}`));
     });
@@ -221,6 +234,10 @@ function fitDurationsToTotal(durations, total) {
   if (!Number.isFinite(total) || total <= 0 || sum <= 0) return clean;
   const scale = total / sum;
   return clean.map((d) => Math.max(0.04, d * scale));
+}
+
+function ffconcatLine(filePath) {
+  return `file '${String(filePath).replace(/'/g, "'\\''")}'`;
 }
 
 function mediaExtFromUrl(url, fallback) {
@@ -739,6 +756,27 @@ app.post("/stitch-final", async (req, res) => {
       }
     }
 
+    let narrationTrackPath = null;
+    if (narrationPaths.length > 1) {
+      const narrationListPath = path.join(tmpDir, "narrations.ffconcat");
+      narrationTrackPath = path.join(tmpDir, "narration-track.m4a");
+      fs.writeFileSync(narrationListPath, narrationPaths.map(ffconcatLine).join("\n") + "\n", "utf8");
+      await runFfmpeg([
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", narrationListPath,
+        "-vn",
+        "-ac", "2",
+        "-ar", "44100",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        narrationTrackPath,
+      ]);
+    } else if (narrationPaths.length === 1) {
+      narrationTrackPath = narrationPaths[0];
+    }
+
     const narrationDurations = await Promise.all(narrationPaths.map((p) => ffprobeDuration(p)));
     const narrationDuration = narrationDurations.reduce((sum, d) => sum + (d || 0), 0);
 
@@ -784,92 +822,116 @@ app.post("/stitch-final", async (req, res) => {
     const finalDuration = Math.max(1, baseTotalDuration, narrationDuration, maxSfxEnd);
     const videoPadDuration = Math.max(0, finalDuration - baseTotalDuration);
 
-    // Build a filter_complex that scales/pads every input to a uniform size,
-    // forces 25fps, then concatenates. This is safer than -f concat demuxer
-    // because the source clips come from different providers (Kling, Veo,
-    // Ken Burns) with different resolutions/codecs/audio tracks.
-    const inputs = [];
-    for (const p of localPaths) {
-      inputs.push(
-        "-fflags", "+genpts+discardcorrupt",
-        "-err_detect", "ignore_err",
-        "-i", p,
-      );
-    }
-    const narrationInputStart = localPaths.length;
-    for (const p of narrationPaths) inputs.push("-i", p);
-    const musicInputIndex = musicPath ? localPaths.length + narrationPaths.length : null;
-    if (musicPath) inputs.push("-i", musicPath);
-    const sfxInputStart = localPaths.length + narrationPaths.length + (musicPath ? 1 : 0);
-    for (const s of sfxPaths) inputs.push("-i", s.path);
-
+    // Keep FFmpeg stable for long projects: normalize each clip in its own
+    // small process, concat the uniform MP4s with the demuxer, then run an
+    // audio-only mix. A single huge filter_complex crashed Railway on 40+
+    // scenes with "Resource temporarily unavailable" / exit 245.
     const n = localPaths.length;
-    const parts = [];
+    const normalizedPaths = [];
     for (let i = 0; i < n; i++) {
       const target = clipTargetDurations[i];
       const srcDur = durations[i] || target;
       const pad = Math.max(0, target - srcDur);
-      // Scale + pad to the target frame, then extend (clone last frame) or
-      // trim to the narration-matched duration so each image holds for as
-      // long as its narration line plays.
-      parts.push(
-        `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+      const normalizedPath = path.join(tmpDir, `normalized-${String(i).padStart(4, "0")}.mp4`);
+      const vf =
+        `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
         `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p,` +
         `tpad=stop_mode=clone:stop_duration=${pad.toFixed(3)},` +
-        `trim=duration=${target.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`
-      );
+        `trim=duration=${target.toFixed(3)},setpts=PTS-STARTPTS`;
+      await runFfmpeg([
+        "-y",
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
+        "-i", localPaths[i],
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-r", "25",
+        "-pix_fmt", "yuv420p",
+        "-threads", "2",
+        "-movflags", "+faststart",
+        normalizedPath,
+      ]);
+      normalizedPaths.push(normalizedPath);
     }
-    const concatLabels = Array.from({ length: n }, (_, i) => `[v${i}]`).join("");
-    parts.push(`${concatLabels}concat=n=${n}:v=1:a=0[vcat]`);
-    parts.push(`[vcat]tpad=stop_mode=clone:stop_duration=${videoPadDuration},trim=duration=${finalDuration},setpts=PTS-STARTPTS[outv]`);
+
+    const concatListPath = path.join(tmpDir, "normalized.ffconcat");
+    const concatVideoPath = path.join(tmpDir, "video-concat.mp4");
+    fs.writeFileSync(concatListPath, normalizedPaths.map(ffconcatLine).join("\n") + "\n", "utf8");
+    await runFfmpeg([
+      "-y",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatListPath,
+      "-c", "copy",
+      "-movflags", "+faststart",
+      concatVideoPath,
+    ]);
+
+    let videoForMixPath = concatVideoPath;
+    if (videoPadDuration > 0.05) {
+      videoForMixPath = path.join(tmpDir, "video-padded.mp4");
+      await runFfmpeg([
+        "-y",
+        "-i", concatVideoPath,
+        "-vf", `tpad=stop_mode=clone:stop_duration=${videoPadDuration.toFixed(3)},trim=duration=${finalDuration.toFixed(3)},setpts=PTS-STARTPTS`,
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-r", "25",
+        "-pix_fmt", "yuv420p",
+        "-threads", "2",
+        "-movflags", "+faststart",
+        videoForMixPath,
+      ]);
+    }
+
+    const mixInputs = ["-i", videoForMixPath];
+    let inputIdx = 1;
     const audioLabels = [];
-    if (narrationPaths.length > 1) {
-      const narrLabels = [];
-      for (let i = 0; i < narrationPaths.length; i++) {
-        const inputIdx = narrationInputStart + i;
-        parts.push(`[${inputIdx}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo[nprep${i}]`);
-        narrLabels.push(`[nprep${i}]`);
-      }
-      parts.push(`${narrLabels.join("")}concat=n=${narrationPaths.length}:v=0:a=1,volume=1.0[narr]`);
+    const audioParts = [];
+    if (narrationTrackPath) {
+      mixInputs.push("-i", narrationTrackPath);
+      audioParts.push(`[${inputIdx}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,volume=1.0[narr]`);
       audioLabels.push("[narr]");
-    } else if (narrationPaths.length === 1) {
-      parts.push(`[${narrationInputStart}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,volume=1.0[narr]`);
-      audioLabels.push("[narr]");
+      inputIdx++;
     }
-    if (musicInputIndex !== null) {
-      parts.push(`[${musicInputIndex}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,aloop=loop=-1:size=2147483647,asetpts=N/SR/TB,volume=${musicVolume}[music]`);
+    if (musicPath) {
+      mixInputs.push("-i", musicPath);
+      audioParts.push(`[${inputIdx}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,aloop=loop=-1:size=2147483647,asetpts=N/SR/TB,volume=${musicVolume}[music]`);
       audioLabels.push("[music]");
+      inputIdx++;
     }
     sfxPaths.forEach((s, i) => {
-      const inputIdx = sfxInputStart + i;
+      mixInputs.push("-i", s.path);
       const delayMs = Math.round(s.timestamp * 1000);
-      parts.push(`[${inputIdx}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,volume=${s.volume},adelay=${delayMs}:all=1[sfx${i}]`);
+      audioParts.push(`[${inputIdx}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,volume=${s.volume},adelay=${delayMs}:all=1[sfx${i}]`);
       audioLabels.push(`[sfx${i}]`);
+      inputIdx++;
     });
     const hasAudio = audioLabels.length > 0;
     if (hasAudio) {
-      parts.push(`anullsrc=channel_layout=stereo:sample_rate=44100:d=${finalDuration}[base]`);
-      parts.push(`[base]${audioLabels.join("")}amix=inputs=${audioLabels.length + 1}:duration=first:dropout_transition=0:normalize=0[aout]`);
+      audioParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100:d=${finalDuration.toFixed(3)}[base]`);
+      audioParts.push(`[base]${audioLabels.join("")}amix=inputs=${audioLabels.length + 1}:duration=first:dropout_transition=0:normalize=0,atrim=duration=${finalDuration.toFixed(3)},asetpts=N/SR/TB[aout]`);
+      await runFfmpeg([
+        "-y",
+        ...mixInputs,
+        "-filter_complex", audioParts.join(";"),
+        "-map", "0:v",
+        "-map", "[aout]",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        outPath,
+      ]);
+    } else {
+      await runFfmpeg(["-y", "-i", videoForMixPath, "-c", "copy", "-movflags", "+faststart", outPath]);
     }
-    const filter = parts.join(";");
-
-    const args = [
-      "-y",
-      ...inputs,
-      "-filter_complex", filter,
-      "-map", "[outv]",
-      ...(hasAudio ? ["-map", "[aout]"] : []),
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "20",
-      "-r", "25",
-      "-pix_fmt", "yuv420p",
-      ...(hasAudio ? ["-c:a", "aac", "-b:a", "192k"] : []),
-      "-movflags", "+faststart",
-      "-max_muxing_queue_size", "1024",
-      outPath,
-    ];
-    await runFfmpeg(args);
 
     // ===== Karaoke caption burn-in (AssemblyAI) =====
     // Runs after audio mixing so we transcribe the actual narration track.
