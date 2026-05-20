@@ -31,11 +31,12 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-verify-caption-burn-v2";
+const RENDER_SERVER_VERSION = "2026-05-20-caption-drawtext-fallback-v3";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
 const CAPTIONS_HIGHLIGHT_BGR = process.env.CAPTIONS_HIGHLIGHT_BGR || "FF309B"; // #9B30FF (BBGGRR)
+const CAPTIONS_FONT_FILE = process.env.CAPTIONS_FONT_FILE || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
 
 function resolveFfmpegBinary() {
   const candidates = [
@@ -713,6 +714,53 @@ async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
   return true;
 }
 
+function escapeDrawtextText(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/:/g, "\\:")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/%/g, "\\%")
+    .replace(/[\r\n]+/g, " ");
+}
+
+function buildDrawtextCaptionFilter(words, { width, height }) {
+  const fontSize = Math.round(height * 0.062);
+  const borderW = Math.max(4, Math.round(height * 0.004));
+  const y = Math.round(height * 0.78);
+  return chunkWords(words, 7)
+    .filter((chunk) => chunk.length > 0)
+    .map((chunk) => {
+      const start = Math.max(0, chunk[0].start / 1000);
+      const end = Math.max(start + 0.2, chunk[chunk.length - 1].end / 1000);
+      const text = escapeDrawtextText(chunk.map((w) => w.text).join(" "));
+      const fontFile = fs.existsSync(CAPTIONS_FONT_FILE) ? `fontfile='${CAPTIONS_FONT_FILE.replace(/'/g, "\\'")}'` : "font='Sans'";
+      return `drawtext=${fontFile}:text='${text}':fontsize=${fontSize}:fontcolor=white:bordercolor=black:borderw=${borderW}:box=1:boxcolor=black@0.35:boxborderw=${Math.round(borderW * 2)}:x=(w-text_w)/2:y=${y}:enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
+    })
+    .join(",");
+}
+
+async function burnCaptionsIntoVideoWithDrawtext(srcPath, destPath, filterPath, words, dims) {
+  const filter = buildDrawtextCaptionFilter(words, dims);
+  if (!filter) throw new Error("No drawtext caption filter could be generated");
+  fs.writeFileSync(filterPath, filter, "utf8");
+  await runFfmpeg([
+    "-y",
+    "-i", srcPath,
+    "-filter_script:v", filterPath,
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "20",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    destPath,
+  ]);
+  return true;
+}
+
 app.post("/stitch-final", async (req, res) => {
   const body = req.body || {};
   const { output_filename, target_aspect = "16:9", return_binary = false } = body;
@@ -998,16 +1046,21 @@ app.post("/stitch-final", async (req, res) => {
         const assPath = path.join(tmpDir, "captions.ass");
         fs.writeFileSync(assPath, ass, "utf8");
         const burnedPath = path.join(tmpDir, "final-captioned.mp4");
-        await burnCaptionsIntoVideo(outPath, burnedPath, assPath);
+        try {
+          await burnCaptionsIntoVideo(outPath, burnedPath, assPath);
+        } catch (assErr) {
+          console.warn("ASS subtitle burn failed; retrying with drawtext captions:", assErr.message);
+          const drawtextPath = path.join(tmpDir, "captions-drawtext.txt");
+          await burnCaptionsIntoVideoWithDrawtext(outPath, burnedPath, drawtextPath, words, { width: W, height: H });
+          captionSource = `${captionSource}+drawtext`;
+        }
         captionedPath = burnedPath;
         console.log(`Burned ${words.length} karaoke captions into final video via ${captionSource}.`);
       } else {
-        console.warn("No caption words were available from AssemblyAI or scene text; shipping uncaptioned video.");
+        throw new Error("No caption words were available from AssemblyAI or scene text");
       }
     } catch (e) {
-      console.warn("Caption burn-in failed, shipping uncaptioned video:", e.message);
-      captionedPath = outPath;
-      captionSource = "failed";
+      throw new Error(`Caption burn-in failed; refusing to ship uncaptioned video: ${e.message}`);
     }
 
     if (return_binary) {
