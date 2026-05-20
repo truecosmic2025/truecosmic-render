@@ -1,4 +1,4 @@
-**
+/**
  * TrueCosmic Ken Burns Render Server
  *
  * Single endpoint: POST /ken-burns
