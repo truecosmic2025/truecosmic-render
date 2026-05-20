@@ -630,6 +630,24 @@ function chunkWords(words, maxWords = 7) {
   return chunks;
 }
 
+function chunkWordsByTime(words, { maxWords = 6, maxDurationSec = 2.8 } = {}) {
+  const chunks = [];
+  let current = [];
+  for (const word of words) {
+    if (!word || typeof word.start !== "number" || typeof word.end !== "number") continue;
+    const proposed = current.concat(word);
+    const duration = (proposed[proposed.length - 1].end - proposed[0].start) / 1000;
+    if (current.length > 0 && (proposed.length > maxWords || duration > maxDurationSec)) {
+      chunks.push(current);
+      current = [word];
+    } else {
+      current = proposed;
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
 function wordsFromTextTimed(text, startSec, endSec) {
   const tokens = String(text || "").match(/\S+/g) || [];
   const durationMs = Math.max(500, (endSec - startSec) * 1000);
@@ -658,51 +676,64 @@ function buildCaptionWordsFromSceneText(captions, durations) {
  * Highlighted word = purple (#9B30FF), rest = white. Large bold centered.
  */
 function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIGHT_BGR }) {
-  const fontSize = Math.round(height * 0.07); // ~75 on 1080p, ~134 on 1920 portrait
+  // Font scaling — captions are bold, centred, ~7% of the video height. This
+  // reads well on both 1080p landscape and 1920 portrait outputs.
+  const fontSize = Math.round(height * 0.07);
   const marginV = Math.round(height * 0.12);
+  // Outline + shadow scale with resolution so the dark stroke stays readable
+  // over any background.
+  const outline = Math.max(3, Math.round(height * 0.004));
+  const shadow = Math.max(2, Math.round(height * 0.002));
+  // Use DejaVu Sans — it's installed in the container via `fonts-dejavu-core`
+  // and libass/fontconfig will resolve it reliably. "Arial Black" is NOT
+  // present on Debian, which caused libass to silently fall back to an
+  // empty glyph set on some builds (the symptom: ASS burn appeared to
+  // succeed but no captions were visible).
+  const fontName = process.env.CAPTIONS_FONT_NAME || "DejaVu Sans";
   const header = [
     "[Script Info]",
     "ScriptType: v4.00+",
     "WrapStyle: 2",
     "ScaledBorderAndShadow: yes",
+    "YCbCr Matrix: TV.709",
     `PlayResX: ${width}`,
     `PlayResY: ${height}`,
     "",
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    `Style: Karaoke,Arial Black,${fontSize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,4,3,2,80,80,${marginV},1`,
+    // PrimaryColour = white, OutlineColour = black, BackColour = translucent black shadow.
+    // BorderStyle=1 (outline + drop shadow), Alignment=2 (bottom-centre).
+    `Style: Karaoke,${fontName},${fontSize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,${outline},${shadow},2,80,80,${marginV},1`,
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
   ];
 
   const events = [];
-  const chunks = chunkWords(words, 7);
+  // Tighter chunks (max 5 words / 2.5s) keep captions readable and in sync
+  // with on-screen narration.
+  const chunks = chunkWordsByTime(words, { maxWords: 5, maxDurationSec: 2.5 });
   for (const chunk of chunks) {
     if (chunk.length === 0) continue;
-    const chunkStart = chunk[0].start / 1000;
     const chunkEnd = chunk[chunk.length - 1].end / 1000;
     for (let i = 0; i < chunk.length; i++) {
       const w = chunk[i];
       const wStart = w.start / 1000;
       const wEnd = i + 1 < chunk.length ? chunk[i + 1].start / 1000 : chunkEnd;
+      if (!(wEnd > wStart)) continue;
       const text = chunk
         .map((cw, j) => {
           const t = escapeAssText(cw.text);
-          if (j === i) return `{\\c&H${highlightBgr}&}${t}{\\c&HFFFFFF&}`;
+          if (j === i) {
+            // Active word: brand purple (#9B30FF) + slightly larger.
+            return `{\\c&H${highlightBgr}&\\fscx110\\fscy110}${t}{\\r}`;
+          }
           return t;
         })
         .join(" ");
       events.push(
         `Dialogue: 0,${formatAssTime(wStart)},${formatAssTime(wEnd)},Karaoke,,0,0,0,,${text}`
       );
-    }
-    // Hold the last word colour briefly until chunkEnd if needed
-    if (chunk.length > 0) {
-      const lastWordEnd = chunk[chunk.length - 1].end / 1000;
-      if (lastWordEnd > chunkEnd) {
-        // no-op, capped above
-      }
     }
   }
 
@@ -770,10 +801,9 @@ async function transcribeWithAssemblyAi(audioPath) {
  * Returns true on success, false on failure (caller keeps original file).
  */
 async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
-  // ffmpeg subtitles filter needs the path escaped (commas, colons, backslashes).
-  // Use the positional form (`subtitles=PATH`) — wrapping the value in single
-  // quotes confuses libavfilter's argument parser on some builds and silently
-  // skips the burn.
+  // Use the `ass=` filter (purpose-built for .ass files) rather than the
+  // generic `subtitles=` filter — it avoids format auto-detection edge cases
+  // that caused silent no-op burns on some libass builds.
   const escaped = assPath
     .replace(/\\/g, "\\\\")
     .replace(/:/g, "\\:")
@@ -782,7 +812,7 @@ async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
   const args = [
     "-y",
     "-i", srcPath,
-    "-vf", `subtitles=${escaped}`,
+    "-vf", `ass=${escaped}`,
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "20",
@@ -792,6 +822,17 @@ async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
     destPath,
   ];
   await runFfmpeg(args);
+  // Sanity-check: ffmpeg can exit 0 even if libass produced no glyphs. A
+  // valid encode should be at least as large as the source, give or take.
+  try {
+    const srcSize = fs.statSync(srcPath).size;
+    const dstSize = fs.statSync(destPath).size;
+    if (dstSize < srcSize * 0.5) {
+      throw new Error(`ASS burn output suspiciously small (${dstSize} vs src ${srcSize})`);
+    }
+  } catch (e) {
+    if (/suspiciously small/.test(e.message)) throw e;
+  }
   return true;
 }
 
@@ -808,17 +849,17 @@ function escapeDrawtextText(value) {
 }
 
 function buildDrawtextCaptionFilter(words, { width, height }) {
-  const fontSize = Math.round(height * 0.062);
-  const borderW = Math.max(4, Math.round(height * 0.004));
-  const y = Math.round(height * 0.78);
-  return chunkWords(words, 7)
+  const fontSize = Math.round(height * 0.07);
+  const borderW = Math.max(5, Math.round(height * 0.006));
+  const y = Math.round(height * 0.72);
+  return chunkWordsByTime(words, { maxWords: 6, maxDurationSec: 2.8 })
     .filter((chunk) => chunk.length > 0)
     .map((chunk) => {
       const start = Math.max(0, chunk[0].start / 1000);
-      const end = Math.max(start + 0.2, chunk[chunk.length - 1].end / 1000);
+      const end = Math.max(start + 0.45, chunk[chunk.length - 1].end / 1000);
       const text = escapeDrawtextText(chunk.map((w) => w.text).join(" "));
       const fontFile = fs.existsSync(CAPTIONS_FONT_FILE) ? `fontfile='${CAPTIONS_FONT_FILE.replace(/'/g, "\\'")}'` : "font='Sans'";
-      return `drawtext=${fontFile}:text='${text}':fontsize=${fontSize}:fontcolor=white:bordercolor=black:borderw=${borderW}:box=1:boxcolor=black@0.35:boxborderw=${Math.round(borderW * 2)}:x=(w-text_w)/2:y=${y}:enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
+      return `drawtext=${fontFile}:text='${text}':fontsize=${fontSize}:fontcolor=white:bordercolor=black:borderw=${borderW}:box=1:boxcolor=black@0.62:boxborderw=${Math.round(borderW * 3)}:x=max(${Math.round(width * 0.04)}\\,(w-text_w)/2):y=${y}:enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
     })
     .join(",");
 }
@@ -1017,18 +1058,21 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
       throw new Error("No caption words available (AssemblyAI returned nothing and no fallback caption text provided)");
     }
 
-    onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} captions (${captionSource})…` });
-    const ass = buildKaraokeAss(words, { width: W, height: H });
-    const assPath = path.join(tmpDir, "captions.ass");
-    fs.writeFileSync(assPath, ass, "utf8");
+    onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} visible captions (${captionSource})…` });
     const burnedPath = path.join(tmpDir, "captioned.mp4");
+    // Prefer the branded karaoke ASS burn (purple active word, white inactive,
+    // dark outline). Only fall back to plain drawtext if libass actually
+    // fails — drawtext can't reproduce per-word highlighting.
+    const assPath = path.join(tmpDir, "captions.ass");
+    fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H }), "utf8");
     try {
       await burnCaptionsIntoVideo(srcPath, burnedPath, assPath);
+      captionSource = `${captionSource}+ass-karaoke`;
     } catch (assErr) {
-      console.warn("ASS subtitle burn failed; retrying with drawtext captions:", assErr.message);
+      console.warn("ASS karaoke burn failed, falling back to drawtext:", assErr.message);
       const drawtextPath = path.join(tmpDir, "captions-drawtext.txt");
       await burnCaptionsIntoVideoWithDrawtext(srcPath, burnedPath, drawtextPath, words, { width: W, height: H });
-      captionSource = `${captionSource}+drawtext`;
+      captionSource = `${captionSource}+drawtext-fallback`;
     }
 
     onProgress({ stage: "uploading", progress: 92, message: "Uploading captioned video…" });
