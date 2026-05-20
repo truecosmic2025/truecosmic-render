@@ -1,4 +1,4 @@
-/**
+**
  * TrueCosmic Ken Burns Render Server
  *
  * Single endpoint: POST /ken-burns
@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-caption-drawtext-fallback-v3";
+const RENDER_SERVER_VERSION = "2026-05-20-caption-fallback-no-hardstop-v4";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -235,7 +235,7 @@ function normalizeCaptionItems(input) {
     .map((item, index) => {
       if (typeof item === "string") return { text: item, scene_number: index + 1 };
       if (!item || typeof item !== "object") return null;
-      const text = String(item.text || item.caption || item.narration_text || item.script_text || "").trim();
+      const text = String(item.text || item.caption || item.scene_text || item.narration_text || item.script_text || "").trim();
       if (!text) return null;
       return { ...item, text };
     })
@@ -663,7 +663,12 @@ async function transcribeWithAssemblyAi(audioPath) {
     const trRes = await fetch("https://api.assemblyai.com/v2/transcript", {
       method: "POST",
       headers: { authorization: ASSEMBLYAI_API_KEY, "content-type": "application/json" },
-      body: JSON.stringify({ audio_url, punctuate: true, format_text: true, speech_model: "universal-2" }),
+      body: JSON.stringify({
+        audio_url,
+        punctuate: true,
+        format_text: true,
+        speech_models: ["universal-2"],
+      }),
     });
     if (!trRes.ok) throw new Error(`AssemblyAI submit ${trRes.status}: ${(await trRes.text()).slice(0, 200)}`);
     const trJson = await trRes.json();
@@ -1057,10 +1062,12 @@ app.post("/stitch-final", async (req, res) => {
         captionedPath = burnedPath;
         console.log(`Burned ${words.length} karaoke captions into final video via ${captionSource}.`);
       } else {
-        throw new Error("No caption words were available from AssemblyAI or scene text");
+        console.warn("Caption burn skipped: no caption words were available from AssemblyAI or scene text; shipping uncaptioned video.");
       }
     } catch (e) {
-      throw new Error(`Caption burn-in failed; refusing to ship uncaptioned video: ${e.message}`);
+      console.warn(`Caption burn-in failed; shipping uncaptioned video while debugging: ${e.message}`);
+      captionedPath = outPath;
+      captionSource = "failed-unburned";
     }
 
     if (return_binary) {
