@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-signed-upload-url-v8";
+const RENDER_SERVER_VERSION = "2026-05-20-subtitles-filter-fix-v9";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -770,12 +770,19 @@ async function transcribeWithAssemblyAi(audioPath) {
  * Returns true on success, false on failure (caller keeps original file).
  */
 async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
-  // ffmpeg subtitles filter needs the path escaped (commas, colons).
-  const escaped = assPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
+  // ffmpeg subtitles filter needs the path escaped (commas, colons, backslashes).
+  // Use the positional form (`subtitles=PATH`) — wrapping the value in single
+  // quotes confuses libavfilter's argument parser on some builds and silently
+  // skips the burn.
+  const escaped = assPath
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'")
+    .replace(/,/g, "\\,");
   const args = [
     "-y",
     "-i", srcPath,
-    "-vf", `subtitles=filename='${escaped}'`,
+    "-vf", `subtitles=${escaped}`,
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "20",
