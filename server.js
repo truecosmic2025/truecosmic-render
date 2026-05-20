@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-async-jobs-sequential-downloads-v7";
+const RENDER_SERVER_VERSION = "2026-05-20-signed-upload-url-v8";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -848,8 +848,11 @@ app.post("/stitch-final", async (req, res) => {
     if (return_binary) {
       return res.status(400).json({ error: "async=true requires return_binary=false (server uploads to storage and exposes video_url via /status/:job_id)" });
     }
-    if (!supabase) {
-      return res.status(400).json({ error: "async mode requires Supabase storage to be configured on the render server" });
+    // Async mode needs SOMEWHERE to put the result. Either a signed upload URL
+    // from the caller (preferred — no creds on the render server) or a
+    // service-role Supabase client configured via env vars (legacy fallback).
+    if (!body.upload_url && !supabase) {
+      return res.status(400).json({ error: "async mode requires either upload_url (signed upload URL) in the body or SUPABASE_URL+SUPABASE_SERVICE_ROLE_KEY env vars on the render server" });
     }
     const job = createJob();
     updateJob(job.id, { clip_count: clipUrls.length, message: `Queued ${clipUrls.length} clips for stitching` });
@@ -1239,10 +1242,29 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       video_url: null,
     };
 
-    // If an output_filename was supplied and storage is configured, upload
-    // and return the public URL. Otherwise, the caller (sync return_binary
-    // path) keeps the file around to stream back.
-    if (output_filename && supabase) {
+    // Upload path priority:
+    //  1. Signed upload URL passed in body.upload_url (preferred — no creds on render server)
+    //  2. Supabase service-role client configured via env vars (legacy fallback)
+    //  3. Neither — caller (sync return_binary path) keeps the file to stream back
+    const uploadUrl = body.upload_url;
+    const publicUrl = body.public_url;
+    if (uploadUrl) {
+      onProgress({ stage: "uploading", progress: 92, message: "Uploading final video…" });
+      const outBuf = fs.readFileSync(captionedPath);
+      const putRes = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "video/mp4", "x-upsert": "true" },
+        body: outBuf,
+      });
+      if (!putRes.ok) {
+        const txt = await putRes.text().catch(() => "");
+        throw new Error(`Signed upload failed (${putRes.status}): ${txt.slice(0, 200)}`);
+      }
+      meta.video_url = publicUrl || null;
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      meta.tmp_dir = null;
+      meta.captioned_path = null;
+    } else if (output_filename && supabase) {
       onProgress({ stage: "uploading", progress: 92, message: "Uploading final video…" });
       const outBuf = fs.readFileSync(captionedPath);
       const { error: upErr } = await supabase.storage
