@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-stable-stitch-normalize";
+const RENDER_SERVER_VERSION = "2026-05-20-stable-stitch-captions-fallback";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -226,6 +226,19 @@ function normalizeDurationList(input) {
       return NaN;
     })
     .map((n) => (Number.isFinite(n) && n > 0 ? n : null));
+}
+
+function normalizeCaptionItems(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item, index) => {
+      if (typeof item === "string") return { text: item, scene_number: index + 1 };
+      if (!item || typeof item !== "object") return null;
+      const text = String(item.text || item.caption || item.narration_text || item.script_text || "").trim();
+      if (!text) return null;
+      return { ...item, text };
+    })
+    .filter(Boolean);
 }
 
 function fitDurationsToTotal(durations, total) {
@@ -545,6 +558,29 @@ function chunkWords(words, maxWords = 7) {
   const chunks = [];
   for (let i = 0; i < words.length; i += maxWords) chunks.push(words.slice(i, i + maxWords));
   return chunks;
+}
+
+function wordsFromTextTimed(text, startSec, endSec) {
+  const tokens = String(text || "").match(/\S+/g) || [];
+  const durationMs = Math.max(500, (endSec - startSec) * 1000);
+  const slotMs = durationMs / Math.max(1, tokens.length);
+  return tokens.map((token, index) => ({
+    text: token,
+    start: Math.round(startSec * 1000 + index * slotMs),
+    end: Math.round(startSec * 1000 + (index + 1) * slotMs),
+  }));
+}
+
+function buildCaptionWordsFromSceneText(captions, durations) {
+  const out = [];
+  let cursor = 0;
+  for (let i = 0; i < durations.length; i++) {
+    const caption = captions[i];
+    const duration = Math.max(0.5, Number(durations[i]) || 0.5);
+    if (caption?.text) out.push(...wordsFromTextTimed(caption.text, cursor, cursor + duration));
+    cursor += duration;
+  }
+  return out;
 }
 
 /**
