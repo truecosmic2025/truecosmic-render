@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-subtitles-filter-fix-v9";
+const RENDER_SERVER_VERSION = "2026-05-20-two-step-captions-v10";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -924,6 +924,134 @@ app.post("/stitch-final", async (req, res) => {
 });
 
 // ==========================================================================
+// POST /burn-captions-only
+// Step 2 of the two-step pipeline. Takes a finished stitched video, runs
+// AssemblyAI transcription on its audio, and burns karaoke captions with a
+// single dedicated ffmpeg call. Always runs as an async job — caller polls
+// `/status/:job_id` and the result is PUT to the supplied signed upload URL.
+//
+// Body: {
+//   video_url:    string  (required) public URL of the stitched mp4
+//   upload_url:   string  (required) signed PUT URL for the captioned mp4
+//   public_url:   string  (optional) final public URL to return in status
+//   target_aspect: "16:9" | "9:16" (defaults to 16:9)
+//   captions:     fallback caption items (used only if AssemblyAI yields nothing)
+//   scenes, clip_duration_weights: same fallback shape as /stitch-final
+// }
+// ==========================================================================
+app.post("/burn-captions-only", async (req, res) => {
+  const body = req.body || {};
+  const { video_url, upload_url, public_url, target_aspect = "16:9" } = body;
+  if (!video_url || !upload_url) {
+    return res.status(400).json({ error: "video_url and upload_url are required" });
+  }
+
+  const job = createJob();
+  updateJob(job.id, { clip_count: 1, message: "Caption job queued" });
+  res.status(202).json({ ok: true, async: true, job_id: job.id, status_url: `/status/${job.id}` });
+
+  setImmediate(() => {
+    runCaptionBurnPipeline(body, video_url, upload_url, public_url, target_aspect, {
+      onProgress: (patch) => updateJob(job.id, patch),
+    })
+      .then((result) => {
+        updateJob(job.id, {
+          status: "complete",
+          stage: "complete",
+          progress: 100,
+          message: "Captions burned",
+          video_url: result.video_url,
+          completed_at: Date.now(),
+        });
+      })
+      .catch((e) => {
+        console.error("burn-captions-only failed", e);
+        updateJob(job.id, {
+          status: "failed",
+          stage: "failed",
+          error: e?.message || "caption burn failed",
+          message: e?.message || "caption burn failed",
+          completed_at: Date.now(),
+        });
+      });
+  });
+});
+
+async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, target_aspect, { onProgress }) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "burn-captions-"));
+  const isPortrait = target_aspect === "9:16";
+  const W = isPortrait ? 1080 : 1920;
+  const H = isPortrait ? 1920 : 1080;
+  try {
+    onProgress({ status: "running", stage: "downloading", progress: 5, message: "Downloading stitched video…" });
+    const srcPath = path.join(tmpDir, "source.mp4");
+    await downloadToFile(videoUrl, srcPath, "stitched video");
+
+    onProgress({ stage: "extracting-audio", progress: 20, message: "Extracting audio for transcription…" });
+    const audioPath = path.join(tmpDir, "source-audio.m4a");
+    await runFfmpeg(["-y", "-i", srcPath, "-vn", "-c:a", "aac", "-b:a", "128k", audioPath]);
+
+    let words = [];
+    let captionSource = "none";
+    if (ASSEMBLYAI_API_KEY) {
+      onProgress({ stage: "transcribing", progress: 35, message: "Transcribing with AssemblyAI…" });
+      words = await transcribeWithAssemblyAi(audioPath);
+      if (words.length > 0) captionSource = "assemblyai";
+    } else {
+      console.warn("ASSEMBLYAI_API_KEY not set on render server; will rely on fallback caption text only.");
+    }
+
+    if (words.length === 0) {
+      const { items: captionItems } = selectCaptionItemsFromBody(body);
+      if (captionItems.length > 0) {
+        // Without per-clip durations we evenly distribute over the video duration.
+        const totalDur = await ffprobeDuration(srcPath);
+        const per = Math.max(1, totalDur / captionItems.length);
+        const fallbackDurations = captionItems.map(() => per);
+        words = buildCaptionWordsFromSceneText(captionItems, fallbackDurations);
+        if (words.length > 0) captionSource = "scene-text-fallback";
+      }
+    }
+
+    if (words.length === 0) {
+      throw new Error("No caption words available (AssemblyAI returned nothing and no fallback caption text provided)");
+    }
+
+    onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} captions (${captionSource})…` });
+    const ass = buildKaraokeAss(words, { width: W, height: H });
+    const assPath = path.join(tmpDir, "captions.ass");
+    fs.writeFileSync(assPath, ass, "utf8");
+    const burnedPath = path.join(tmpDir, "captioned.mp4");
+    try {
+      await burnCaptionsIntoVideo(srcPath, burnedPath, assPath);
+    } catch (assErr) {
+      console.warn("ASS subtitle burn failed; retrying with drawtext captions:", assErr.message);
+      const drawtextPath = path.join(tmpDir, "captions-drawtext.txt");
+      await burnCaptionsIntoVideoWithDrawtext(srcPath, burnedPath, drawtextPath, words, { width: W, height: H });
+      captionSource = `${captionSource}+drawtext`;
+    }
+
+    onProgress({ stage: "uploading", progress: 92, message: "Uploading captioned video…" });
+    const outBuf = fs.readFileSync(burnedPath);
+    const putRes = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { "Content-Type": "video/mp4", "x-upsert": "true" },
+      body: outBuf,
+    });
+    if (!putRes.ok) {
+      const txt = await putRes.text().catch(() => "");
+      throw new Error(`Signed upload failed (${putRes.status}): ${txt.slice(0, 200)}`);
+    }
+
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    return { video_url: publicUrl || null, caption_source: captionSource, word_count: words.length };
+  } catch (e) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    throw e;
+  }
+}
+
+// ==========================================================================
 // Pipeline: all the heavy lifting. Pulled out of the handler so it can be
 // driven either synchronously (returning a result for HTTP response) or
 // asynchronously (driven by a job, with progress callbacks).
@@ -1187,13 +1315,18 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     }
 
     // ===== Karaoke caption burn-in =====
-    // Prefer AssemblyAI word timings when available, fall back to scene
-    // narration/script text supplied by the app, and if both sources fail,
-    // still ship the final video without captions.
-    onProgress({ stage: "burning-captions", progress: 84, message: "Burning captions…" });
+    // Two-step pipeline: when the caller passes skip_captions=true, we ship
+    // the stitched (uncaptioned) video as-is. A separate `/burn-captions-only`
+    // job is responsible for transcription + caption burn. This isolates the
+    // two complex failure modes (long ffmpeg stitch vs caption burn).
     let captionedPath = outPath;
-    let captionSource = "none";
+    let captionSource = body.skip_captions ? "skipped-two-step-pipeline" : "none";
+    if (body.skip_captions) {
+      onProgress({ stage: "stitched", progress: 90, message: "Stitch complete (captions deferred to burn step)" });
+    }
     try {
+      if (body.skip_captions) throw new Error("__skip_captions__");
+      onProgress({ stage: "burning-captions", progress: 84, message: "Burning captions…" });
       const { key: captionPayloadKey, items: captionItems } = selectCaptionItemsFromBody(body);
       console.log(`Caption payload key: ${captionPayloadKey}; normalized caption items: ${captionItems.length}.`);
       let words = [];
@@ -1232,9 +1365,13 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
         console.warn("Caption burn skipped: no caption words were available from AssemblyAI or scene text; shipping uncaptioned video.");
       }
     } catch (e) {
-      console.warn(`Caption burn-in failed; shipping uncaptioned video while debugging: ${e.message}`);
-      captionedPath = outPath;
-      captionSource = "failed-unburned";
+      if (e && e.message === "__skip_captions__") {
+        captionedPath = outPath;
+      } else {
+        console.warn(`Caption burn-in failed; shipping uncaptioned video while debugging: ${e.message}`);
+        captionedPath = outPath;
+        captionSource = "failed-unburned";
+      }
     }
 
     const captionsTag = captionedPath !== outPath ? `burned:${captionSource}` : captionSource;
