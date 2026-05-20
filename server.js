@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-caption-fallback-no-hardstop-v4";
+const RENDER_SERVER_VERSION = "2026-05-20-async-jobs-sequential-downloads-v7";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -119,6 +119,54 @@ app.get("/health", async (_req, res) => {
   } catch (e) {
     res.status(503).json({ ok: false, service: "truecosmic-ken-burns", server_version: RENDER_SERVER_VERSION, ffmpeg: FFMPEG_BIN, ffprobe: FFPROBE_BIN, storage_uploads: Boolean(supabase), error: e.message });
   }
+});
+
+// ==========================================================================
+// Async job registry for long-running /stitch-final renders.
+// Allows the client/edge-function to fire-and-poll instead of holding a
+// connection open for many minutes (which Railway's proxy will reset).
+// ==========================================================================
+const jobs = new Map();
+const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+
+function createJob() {
+  const id = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  const job = {
+    id,
+    status: "queued",
+    stage: "queued",
+    progress: 0,
+    message: "Job queued",
+    clip_count: 0,
+    clips_downloaded: 0,
+    video_url: null,
+    error: null,
+    created_at: Date.now(),
+    updated_at: Date.now(),
+    completed_at: null,
+  };
+  jobs.set(id, job);
+  return job;
+}
+
+function updateJob(id, patch) {
+  const job = jobs.get(id);
+  if (!job) return;
+  Object.assign(job, patch, { updated_at: Date.now() });
+}
+
+// Periodic cleanup so jobs don't pile up in memory forever.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs.entries()) {
+    if (now - job.updated_at > JOB_TTL_MS) jobs.delete(id);
+  }
+}, 30 * 60 * 1000).unref?.();
+
+app.get("/status/:job_id", (req, res) => {
+  const job = jobs.get(req.params.job_id);
+  if (!job) return res.status(404).json({ error: "job not found", job_id: req.params.job_id });
+  res.json(job);
 });
 
 function ffmpegVersion() {
@@ -240,6 +288,27 @@ function normalizeCaptionItems(input) {
       return { ...item, text };
     })
     .filter(Boolean);
+}
+
+function selectCaptionItemsFromBody(body) {
+  const candidates = [
+    ["captions", body?.captions],
+    ["caption_items", body?.caption_items],
+    ["captionItems", body?.captionItems],
+    ["caption_rows", body?.caption_rows],
+    ["captionRows", body?.captionRows],
+    ["scene_captions", body?.scene_captions],
+    ["sceneCaptions", body?.sceneCaptions],
+    ["scenes", body?.scenes],
+    ["scene_breakdowns", body?.scene_breakdowns],
+    ["sceneBreakdowns", body?.sceneBreakdowns],
+    ["breakdowns", body?.breakdowns],
+  ];
+  for (const [key, value] of candidates) {
+    const items = normalizeCaptionItems(value);
+    if (items.length > 0) return { key, items };
+  }
+  return { key: "none", items: [] };
 }
 
 function fitDurationsToTotal(durations, total) {
@@ -768,13 +837,88 @@ async function burnCaptionsIntoVideoWithDrawtext(srcPath, destPath, filterPath, 
 
 app.post("/stitch-final", async (req, res) => {
   const body = req.body || {};
-  const { output_filename, target_aspect = "16:9", return_binary = false } = body;
+  const { output_filename, target_aspect = "16:9", return_binary = false, async: asyncMode = false } = body;
   const clipUrls = flattenClipUrls(body.clip_urls || body.clips);
   if (clipUrls.length === 0 || (!return_binary && !output_filename)) {
     return res.status(400).json({ error: "clip_urls (non-empty array) and output_filename required unless return_binary=true" });
   }
-  let binaryResponseInProgress = false;
 
+  // ===== Async mode: respond immediately with job_id and run in background =====
+  if (asyncMode) {
+    if (return_binary) {
+      return res.status(400).json({ error: "async=true requires return_binary=false (server uploads to storage and exposes video_url via /status/:job_id)" });
+    }
+    if (!supabase) {
+      return res.status(400).json({ error: "async mode requires Supabase storage to be configured on the render server" });
+    }
+    const job = createJob();
+    updateJob(job.id, { clip_count: clipUrls.length, message: `Queued ${clipUrls.length} clips for stitching` });
+    res.status(202).json({ ok: true, async: true, job_id: job.id, status_url: `/status/${job.id}`, clip_count: clipUrls.length });
+    // Fire-and-forget: errors are captured into the job record.
+    setImmediate(() => {
+      runStitchPipeline(body, clipUrls, target_aspect, output_filename, {
+        onProgress: (patch) => updateJob(job.id, patch),
+      })
+        .then((result) => {
+          updateJob(job.id, {
+            status: "complete",
+            stage: "complete",
+            progress: 100,
+            message: "Render complete",
+            video_url: result.video_url,
+            clip_count: result.clip_count,
+            completed_at: Date.now(),
+          });
+        })
+        .catch((e) => {
+          console.error("async stitch-final failed", e);
+          updateJob(job.id, {
+            status: "failed",
+            stage: "failed",
+            error: e?.message || "stitch failed",
+            message: e?.message || "stitch failed",
+            completed_at: Date.now(),
+          });
+        });
+    });
+    return;
+  }
+
+  // ===== Synchronous mode (legacy / return_binary): run inline and respond =====
+  try {
+    const result = await runStitchPipeline(body, clipUrls, target_aspect, output_filename, { onProgress: () => {} });
+    if (return_binary) {
+      res.setHeader("X-Clip-Count", String(result.clip_count));
+      res.setHeader("X-Narration-Count", String(result.narration_count));
+      res.setHeader("X-Sfx-Count", String(result.sfx_count));
+      res.setHeader("X-Has-Music", result.has_music ? "true" : "false");
+      res.setHeader("X-Captions", result.captions);
+      return res.sendFile(result.captioned_path, { headers: { "Content-Type": "video/mp4" } }, () => {
+        try { fs.rmSync(result.tmp_dir, { recursive: true, force: true }); } catch {}
+      });
+    }
+    try { fs.rmSync(result.tmp_dir, { recursive: true, force: true }); } catch {}
+    return res.json({
+      ok: true,
+      video_url: result.video_url,
+      clip_count: result.clip_count,
+      narration_count: result.narration_count,
+      sfx_count: result.sfx_count,
+      has_music: result.has_music,
+      captions: result.captions,
+    });
+  } catch (e) {
+    console.error("stitch-final error", e);
+    return res.status(500).json({ error: e.message || "stitch failed" });
+  }
+});
+
+// ==========================================================================
+// Pipeline: all the heavy lifting. Pulled out of the handler so it can be
+// driven either synchronously (returning a result for HTTP response) or
+// asynchronously (driven by a job, with progress callbacks).
+// ==========================================================================
+async function runStitchPipeline(body, clipUrls, target_aspect, output_filename, { onProgress }) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "stitch-"));
   const outPath = path.join(tmpDir, "final.mp4");
   const isPortrait = target_aspect === "9:16";
@@ -782,19 +926,24 @@ app.post("/stitch-final", async (req, res) => {
   const H = isPortrait ? 1920 : 1080;
 
   try {
-    // Download all video parts in parallel (with retry). Nested arrays/objects
-    // were flattened above, so long scripts split into part 1/2/3 are stitched
-    // into one final video in the exact incoming order.
-    const localPaths = await Promise.all(clipUrls.map(async (url, i) => {
+    // Download all video parts SEQUENTIALLY (one at a time). 40+ concurrent
+    // downloads spike memory/network on Railway and crashed the container
+    // before FFmpeg even started. Sequential keeps memory flat.
+    onProgress({ status: "running", stage: "downloading", progress: 2, message: `Downloading ${clipUrls.length} clips sequentially…`, clip_count: clipUrls.length, clips_downloaded: 0 });
+    const localPaths = [];
+    for (let i = 0; i < clipUrls.length; i++) {
       const dest = path.join(tmpDir, `clip-${String(i).padStart(4, "0")}.mp4`);
-      await downloadToFile(url, dest, `clip ${i + 1}`);
-      return dest;
-    }));
+      await downloadToFile(clipUrls[i], dest, `clip ${i + 1}`);
+      localPaths.push(dest);
+      const pct = 2 + Math.round((i + 1) / clipUrls.length * 28); // 2..30
+      onProgress({ stage: "downloading", progress: pct, message: `Downloaded clip ${i + 1}/${clipUrls.length}`, clips_downloaded: i + 1 });
+    }
 
     const durations = await Promise.all(localPaths.map((p) => ffprobeDuration(p)));
     const totalDuration = Math.max(1, durations.reduce((sum, d) => sum + (d || 0), 0) || localPaths.length * 5);
 
     const narrationItems = normalizeNarrationItems(body);
+    onProgress({ stage: "downloading-audio", progress: 32, message: `Downloading ${narrationItems.length} narration tracks…` });
     const narrationPaths = [];
     for (let i = 0; i < narrationItems.length; i++) {
       const ext = mediaExtFromUrl(narrationItems[i].url, "mp3");
@@ -916,6 +1065,7 @@ app.post("/stitch-final", async (req, res) => {
     // audio-only mix. A single huge filter_complex crashed Railway on 40+
     // scenes with "Resource temporarily unavailable" / exit 245.
     const n = localPaths.length;
+    onProgress({ stage: "processing", progress: 38, message: `Normalizing ${n} clips…` });
     const normalizedPaths = [];
     for (let i = 0; i < n; i++) {
       const target = clipTargetDurations[i];
@@ -944,8 +1094,11 @@ app.post("/stitch-final", async (req, res) => {
         normalizedPath,
       ]);
       normalizedPaths.push(normalizedPath);
+      const pct = 38 + Math.round((i + 1) / n * 30); // 38..68
+      onProgress({ stage: "processing", progress: pct, message: `Normalized clip ${i + 1}/${n}` });
     }
 
+    onProgress({ stage: "processing", progress: 70, message: "Concatenating clips…" });
     const concatListPath = path.join(tmpDir, "normalized.ffconcat");
     const concatVideoPath = path.join(tmpDir, "video-concat.mp4");
     fs.writeFileSync(concatListPath, normalizedPaths.map(ffconcatLine).join("\n") + "\n", "utf8");
@@ -978,6 +1131,7 @@ app.post("/stitch-final", async (req, res) => {
       ]);
     }
 
+    onProgress({ stage: "processing", progress: 76, message: "Mixing audio tracks…" });
     const mixInputs = ["-i", videoForMixPath];
     let inputIdx = 1;
     const audioLabels = [];
@@ -1023,16 +1177,15 @@ app.post("/stitch-final", async (req, res) => {
     }
 
     // ===== Karaoke caption burn-in =====
-    // Prefer AssemblyAI word timings when available, but ALWAYS fall back to
-    // the scene narration/script text supplied by the app. This prevents the
-    // server from silently shipping an uncaptioned final video when AssemblyAI
-    // is missing, returns no words, or fails.
+    // Prefer AssemblyAI word timings when available, fall back to scene
+    // narration/script text supplied by the app, and if both sources fail,
+    // still ship the final video without captions.
+    onProgress({ stage: "burning-captions", progress: 84, message: "Burning captions…" });
     let captionedPath = outPath;
     let captionSource = "none";
     try {
-      const captionItems = normalizeCaptionItems(
-        body.captions || body.caption_items || body.captionItems || body.scene_captions || body.scenes
-      );
+      const { key: captionPayloadKey, items: captionItems } = selectCaptionItemsFromBody(body);
+      console.log(`Caption payload key: ${captionPayloadKey}; normalized caption items: ${captionItems.length}.`);
       let words = [];
       if (ASSEMBLYAI_API_KEY && hasAudio) {
         const audioOnly = path.join(tmpDir, "final-audio.m4a");
@@ -1044,6 +1197,10 @@ app.post("/stitch-final", async (req, res) => {
       if (words.length === 0 && captionItems.length > 0) {
         words = buildCaptionWordsFromSceneText(captionItems, clipTargetDurations);
         if (words.length > 0) captionSource = "scene-text";
+      }
+
+      if (words.length === 0) {
+        captionSource = "unburned-no-caption-words";
       }
 
       if (words.length > 0) {
@@ -1070,33 +1227,40 @@ app.post("/stitch-final", async (req, res) => {
       captionSource = "failed-unburned";
     }
 
-    if (return_binary) {
-      binaryResponseInProgress = true;
-      res.setHeader("X-Clip-Count", String(n));
-      res.setHeader("X-Narration-Count", String(narrationPaths.length));
-      res.setHeader("X-Sfx-Count", String(sfxPaths.length));
-      res.setHeader("X-Has-Music", musicPath ? "true" : "false");
-      res.setHeader("X-Captions", captionedPath !== outPath ? `burned:${captionSource}` : captionSource);
-      return res.sendFile(captionedPath, { headers: { "Content-Type": "video/mp4" } }, () => {
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-      });
+    const captionsTag = captionedPath !== outPath ? `burned:${captionSource}` : captionSource;
+    const meta = {
+      clip_count: n,
+      narration_count: narrationPaths.length,
+      sfx_count: sfxPaths.length,
+      has_music: Boolean(musicPath),
+      captions: captionsTag,
+      tmp_dir: tmpDir,
+      captioned_path: captionedPath,
+      video_url: null,
+    };
+
+    // If an output_filename was supplied and storage is configured, upload
+    // and return the public URL. Otherwise, the caller (sync return_binary
+    // path) keeps the file around to stream back.
+    if (output_filename && supabase) {
+      onProgress({ stage: "uploading", progress: 92, message: "Uploading final video…" });
+      const outBuf = fs.readFileSync(captionedPath);
+      const { error: upErr } = await supabase.storage
+        .from("final-videos")
+        .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
+      if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
+      const { data: pub } = supabase.storage.from("final-videos").getPublicUrl(output_filename);
+      meta.video_url = pub.publicUrl;
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      meta.tmp_dir = null;
+      meta.captioned_path = null;
     }
 
-    assertStorageConfigured();
-    const outBuf = fs.readFileSync(captionedPath);
-    const { error: upErr } = await supabase.storage
-      .from("final-videos")
-      .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
-    if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
-    const { data: pub } = supabase.storage.from("final-videos").getPublicUrl(output_filename);
-    res.json({ ok: true, video_url: pub.publicUrl, clip_count: n, narration_count: narrationPaths.length, sfx_count: sfxPaths.length, has_music: Boolean(musicPath), captions: captionedPath !== outPath ? `burned:${captionSource}` : captionSource });
+    return meta;
   } catch (e) {
-    console.error("stitch-final error", e);
-    res.status(500).json({ error: e.message || "stitch failed" });
-  } finally {
-    if (binaryResponseInProgress) return;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    throw e;
   }
-});
+}
 
 app.listen(PORT, () => console.log(`Ken Burns render server listening on :${PORT}; ffmpeg=${FFMPEG_BIN}`));
