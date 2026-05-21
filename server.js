@@ -8,9 +8,9 @@
  * Downloads the image, applies an FFmpeg zoompan filter, outputs 1920x1080 @ 25fps,
  * uploads to the Supabase `generated-clips` bucket and returns { clip_url }.
  *
- * Required env for upload endpoints: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
- * `/stitch-final` can run without Supabase credentials when called with
- * `{ return_binary: true }`; the caller uploads the returned MP4 itself.
+ * Upload endpoints prefer caller-provided signed upload URLs so Railway does
+ * not need Supabase credentials. Legacy direct uploads still work when env
+ * vars are present.
  * Requires `ffmpeg` binary in the container or the bundled `ffmpeg-static` binary.
  */
 
@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-v14";
+const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-signed-upload-v15";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -76,12 +76,12 @@ let supabase = null;
 if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 } else {
-  console.warn("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing; upload endpoints are disabled, but /stitch-final binary mode will still work.");
+  console.warn("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing; direct storage uploads are disabled. Signed upload URL flows will still work.");
 }
 
 function assertStorageConfigured() {
   if (!supabase) {
-    throw new Error("Storage upload is not configured on this render server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, or use /stitch-final with return_binary=true.");
+    throw new Error("Storage upload is not configured on this render server. Pass upload_url/public_url for signed upload, or configure legacy storage env vars.");
   }
 }
 
@@ -536,10 +536,10 @@ app.post("/probe-media", async (req, res) => {
 
 /**
  * POST /extract-clip
- * Body: { source_video_url, start_seconds, duration_seconds, output_filename, aspect_ratio="9:16" }
+ * Body: { source_video_url, start_seconds, duration_seconds, output_filename, aspect_ratio="9:16", upload_url?, public_url? }
  * Cuts a sub-clip from a source video, center-crops to the requested aspect ratio
- * (default 9:16 -> 1080x1920), re-encodes, uploads to the `generated-clips` bucket,
- * and returns { clip_url, duration }.
+  * (default 9:16 -> 1080x1920), re-encodes, uploads via signed upload URL
+  * when provided (legacy bucket upload fallback), and returns { clip_url, duration }.
  */
 app.post("/extract-clip", async (req, res) => {
   const {
@@ -548,6 +548,8 @@ app.post("/extract-clip", async (req, res) => {
     duration_seconds,
     output_filename,
     aspect_ratio = "9:16",
+    upload_url,
+    public_url,
   } = req.body || {};
   if (!source_video_url || !output_filename || !duration_seconds) {
     return res.status(400).json({ error: "source_video_url, duration_seconds, output_filename required" });
@@ -595,14 +597,28 @@ app.post("/extract-clip", async (req, res) => {
 
     const actualDuration = await ffprobeDuration(outPath).catch(() => dur);
 
-    assertStorageConfigured();
     const outBuf = fs.readFileSync(outPath);
-    const { error: upErr } = await supabase.storage
-      .from("generated-clips")
-      .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
-    if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
-    const { data: pub } = supabase.storage.from("generated-clips").getPublicUrl(output_filename);
-    res.json({ ok: true, clip_url: pub.publicUrl, duration: actualDuration });
+    let clipUrl = public_url || null;
+    if (upload_url) {
+      const putRes = await fetch(upload_url, {
+        method: "PUT",
+        headers: { "Content-Type": "video/mp4", "x-upsert": "true" },
+        body: outBuf,
+      });
+      if (!putRes.ok) {
+        const txt = await putRes.text().catch(() => "");
+        throw new Error(`Signed upload failed (${putRes.status}): ${txt.slice(0, 200)}`);
+      }
+    } else {
+      assertStorageConfigured();
+      const { error: upErr } = await supabase.storage
+        .from("generated-clips")
+        .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
+      if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
+      const { data: pub } = supabase.storage.from("generated-clips").getPublicUrl(output_filename);
+      clipUrl = pub.publicUrl;
+    }
+    res.json({ ok: true, clip_url: clipUrl, duration: actualDuration });
   } catch (e) {
     console.error("extract-clip failed", e);
     res.status(500).json({ error: e.message || "extract failed" });
