@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-20-two-step-captions-v10";
+const RENDER_SERVER_VERSION = "2026-05-21-two-step-ass-karaoke-verified-v13";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -256,6 +256,46 @@ function ffprobeDuration(filePath) {
       resolve(Number.isFinite(n) && n > 0 ? n : null);
     });
   });
+}
+
+async function extractFramePng(videoPath, framePath, atSec) {
+  await runFfmpeg([
+    "-y",
+    "-ss", String(Math.max(0, atSec)),
+    "-i", videoPath,
+    "-frames:v", "1",
+    "-f", "image2",
+    framePath,
+  ], { timeoutMs: 2 * 60 * 1000 });
+}
+
+function findCaptionProbeTimes(words) {
+  const times = [];
+  for (const word of words || []) {
+    if (typeof word.start !== "number" || typeof word.end !== "number") continue;
+    const mid = ((word.start + word.end) / 2) / 1000;
+    if (Number.isFinite(mid) && mid >= 0) times.push(mid);
+    if (times.length >= 8) break;
+  }
+  return times.length ? times : [1, 3, 5, 8, 12];
+}
+
+async function assertCaptionBurnVisible(originalPath, captionedPath, words, tmpDir) {
+  const probeTimes = findCaptionProbeTimes(words);
+  let largestDelta = 0;
+  for (let i = 0; i < probeTimes.length; i++) {
+    const t = probeTimes[i];
+    const before = path.join(tmpDir, `caption-probe-before-${i}.png`);
+    const after = path.join(tmpDir, `caption-probe-after-${i}.png`);
+    await extractFramePng(originalPath, before, t);
+    await extractFramePng(captionedPath, after, t);
+    const beforeSize = fs.statSync(before).size;
+    const afterSize = fs.statSync(after).size;
+    const delta = Math.abs(afterSize - beforeSize);
+    largestDelta = Math.max(largestDelta, delta);
+    if (delta > 1200) return;
+  }
+  throw new Error(`ASS caption burn produced no visible frame changes (largest probe delta ${largestDelta} bytes)`);
 }
 
 function clampNumber(value, fallback, min, max) {
@@ -800,7 +840,7 @@ async function transcribeWithAssemblyAi(audioPath) {
  * Burn karaoke ASS captions into a video file. Replaces destPath atomically.
  * Returns true on success, false on failure (caller keeps original file).
  */
-async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
+async function burnCaptionsIntoVideo(srcPath, destPath, assPath, words = [], tmpDir = path.dirname(destPath)) {
   // Use the `ass=` filter (purpose-built for .ass files) rather than the
   // generic `subtitles=` filter — it avoids format auto-detection edge cases
   // that caused silent no-op burns on some libass builds.
@@ -833,6 +873,7 @@ async function burnCaptionsIntoVideo(srcPath, destPath, assPath) {
   } catch (e) {
     if (/suspiciously small/.test(e.message)) throw e;
   }
+  await assertCaptionBurnVisible(srcPath, destPath, words, tmpDir);
   return true;
 }
 
@@ -1060,20 +1101,13 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
 
     onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} visible captions (${captionSource})…` });
     const burnedPath = path.join(tmpDir, "captioned.mp4");
-    // Prefer the branded karaoke ASS burn (purple active word, white inactive,
-    // dark outline). Only fall back to plain drawtext if libass actually
-    // fails — drawtext can't reproduce per-word highlighting.
+    // Branded karaoke captions must be produced by ASS/libass: active word
+    // purple (#9B30FF), inactive words white, bold centered, dark outline.
+    // Do not silently fall back to plain drawtext or upload an uncaptioned MP4.
     const assPath = path.join(tmpDir, "captions.ass");
     fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H }), "utf8");
-    try {
-      await burnCaptionsIntoVideo(srcPath, burnedPath, assPath);
-      captionSource = `${captionSource}+ass-karaoke`;
-    } catch (assErr) {
-      console.warn("ASS karaoke burn failed, falling back to drawtext:", assErr.message);
-      const drawtextPath = path.join(tmpDir, "captions-drawtext.txt");
-      await burnCaptionsIntoVideoWithDrawtext(srcPath, burnedPath, drawtextPath, words, { width: W, height: H });
-      captionSource = `${captionSource}+drawtext-fallback`;
-    }
+    await burnCaptionsIntoVideo(srcPath, burnedPath, assPath, words, tmpDir);
+    captionSource = `${captionSource}+ass-karaoke`;
 
     onProgress({ stage: "uploading", progress: 92, message: "Uploading captioned video…" });
     const outBuf = fs.readFileSync(burnedPath);
@@ -1395,26 +1429,18 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
         const assPath = path.join(tmpDir, "captions.ass");
         fs.writeFileSync(assPath, ass, "utf8");
         const burnedPath = path.join(tmpDir, "final-captioned.mp4");
-        try {
-          await burnCaptionsIntoVideo(outPath, burnedPath, assPath);
-        } catch (assErr) {
-          console.warn("ASS subtitle burn failed; retrying with drawtext captions:", assErr.message);
-          const drawtextPath = path.join(tmpDir, "captions-drawtext.txt");
-          await burnCaptionsIntoVideoWithDrawtext(outPath, burnedPath, drawtextPath, words, { width: W, height: H });
-          captionSource = `${captionSource}+drawtext`;
-        }
+        await burnCaptionsIntoVideo(outPath, burnedPath, assPath, words, tmpDir);
+        captionSource = `${captionSource}+ass-karaoke`;
         captionedPath = burnedPath;
         console.log(`Burned ${words.length} karaoke captions into final video via ${captionSource}.`);
       } else {
-        console.warn("Caption burn skipped: no caption words were available from AssemblyAI or scene text; shipping uncaptioned video.");
+        throw new Error("No caption words were available from AssemblyAI or scene text");
       }
     } catch (e) {
       if (e && e.message === "__skip_captions__") {
         captionedPath = outPath;
       } else {
-        console.warn(`Caption burn-in failed; shipping uncaptioned video while debugging: ${e.message}`);
-        captionedPath = outPath;
-        captionSource = "failed-unburned";
+        throw new Error(`Caption burn-in failed; refusing to ship uncaptioned video: ${e.message}`);
       }
     }
 
