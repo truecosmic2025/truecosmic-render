@@ -31,12 +31,13 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-letterbox-v16";
+const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-letterbox-v18-emoji";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
 const CAPTIONS_HIGHLIGHT_BGR = process.env.CAPTIONS_HIGHLIGHT_BGR || "FF309B"; // #9B30FF (BBGGRR)
 const CAPTIONS_FONT_FILE = process.env.CAPTIONS_FONT_FILE || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+const EMOJI_FONT_FILE = process.env.EMOJI_FONT_FILE || "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
 
 function resolveFfmpegBinary() {
   const candidates = [
@@ -550,6 +551,10 @@ app.post("/extract-clip", async (req, res) => {
     aspect_ratio = "9:16",
     upload_url,
     public_url,
+    top_text,
+    bottom_text,
+    top_emoji,
+    bottom_emoji,
   } = req.body || {};
   if (!source_video_url || !output_filename || !duration_seconds) {
     return res.status(400).json({ error: "source_video_url, duration_seconds, output_filename required" });
@@ -581,6 +586,62 @@ app.post("/extract-clip", async (req, res) => {
       vfChain =
         "scale=1920:1080:force_original_aspect_ratio=decrease," +
         "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
+    }
+
+    // Burn branded text into the top/bottom letterbox bars (9:16 only —
+    // that's the path that produces meaningful empty bars from a 16:9 source).
+    // Source final video is 1920x1080 -> scaled to 1080x607.5 inside 1080x1920,
+    // leaving ~656px black bars top and bottom.
+    const escapeDrawText = (s) =>
+      String(s)
+        .replace(/\\/g, "\\\\")
+        .replace(/:/g, "\\:")
+        .replace(/'/g, "\\\\\\'")
+        .replace(/%/g, "\\%");
+    const fontFile = CAPTIONS_FONT_FILE;
+    const emojiFontFile = EMOJI_FONT_FILE;
+    const drawtextParts = [];
+    if (aspect_ratio === "9:16") {
+      const TOP_BAR_H = 656;       // (1920 - 608) / 2, rounded
+      const BOTTOM_BAR_Y = 1264;   // 1920 - 656
+      const BOTTOM_BAR_H = 656;
+
+      // Top bar: emoji on its own line (rendered with NotoColorEmoji so the
+      // color glyph shows), then the bold text line below it. We stack them
+      // so we don't have to know either glyph's width.
+      if (top_emoji && String(top_emoji).trim()) {
+        drawtextParts.push(
+          `drawtext=fontfile='${emojiFontFile}':text='${escapeDrawText(top_emoji)}'` +
+            `:fontcolor=white:fontsize=109` +  // NotoColorEmoji is a bitmap font; 109 is its native size
+            `:x=(w-text_w)/2:y=${Math.round(TOP_BAR_H / 2 - 110)}`,
+        );
+      }
+      if (top_text && String(top_text).trim()) {
+        drawtextParts.push(
+          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(top_text)}'` +
+            `:fontcolor=white:fontsize=64:borderw=3:bordercolor=black` +
+            `:x=(w-text_w)/2:y=${Math.round(TOP_BAR_H / 2 + 30)}`,
+        );
+      }
+      // Bottom bar: text on top line, emoji centered below it.
+      if (bottom_text && String(bottom_text).trim()) {
+        drawtextParts.push(
+          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(bottom_text)}'` +
+            `:fontcolor=white:fontsize=56:borderw=3:bordercolor=black` +
+            `:x=(w-text_w)/2:y=${BOTTOM_BAR_Y + Math.round(BOTTOM_BAR_H / 2 - 90)}` +
+            `:line_spacing=10`,
+        );
+      }
+      if (bottom_emoji && String(bottom_emoji).trim()) {
+        drawtextParts.push(
+          `drawtext=fontfile='${emojiFontFile}':text='${escapeDrawText(bottom_emoji)}'` +
+            `:fontcolor=white:fontsize=109` +
+            `:x=(w-text_w)/2:y=${BOTTOM_BAR_Y + Math.round(BOTTOM_BAR_H / 2 + 10)}`,
+        );
+      }
+    }
+    if (drawtextParts.length) {
+      vfChain = `${vfChain},${drawtextParts.join(",")}`;
     }
 
     const start = Math.max(0, Number(start_seconds) || 0);
