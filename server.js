@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-21-two-step-ass-karaoke-verified-v13";
+const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-v14";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -507,6 +507,106 @@ app.post("/ken-burns", async (req, res) => {
     res.status(500).json({ error: e.message || "render failed" });
   } finally {
     if (binaryResponseInProgress) return;
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+/**
+ * POST /probe-media
+ * Body: { url }
+ * Returns { duration } (seconds) for the given remote media file.
+ */
+app.post("/probe-media", async (req, res) => {
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "probe-"));
+  const filePath = path.join(tmpDir, "in.mp4");
+  try {
+    const buf = await downloadWithRetry(url);
+    fs.writeFileSync(filePath, buf);
+    const duration = await ffprobeDuration(filePath);
+    res.json({ ok: true, duration });
+  } catch (e) {
+    console.error("probe-media failed", e);
+    res.status(500).json({ error: e.message || "probe failed" });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+/**
+ * POST /extract-clip
+ * Body: { source_video_url, start_seconds, duration_seconds, output_filename, aspect_ratio="9:16" }
+ * Cuts a sub-clip from a source video, center-crops to the requested aspect ratio
+ * (default 9:16 -> 1080x1920), re-encodes, uploads to the `generated-clips` bucket,
+ * and returns { clip_url, duration }.
+ */
+app.post("/extract-clip", async (req, res) => {
+  const {
+    source_video_url,
+    start_seconds = 0,
+    duration_seconds,
+    output_filename,
+    aspect_ratio = "9:16",
+  } = req.body || {};
+  if (!source_video_url || !output_filename || !duration_seconds) {
+    return res.status(400).json({ error: "source_video_url, duration_seconds, output_filename required" });
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clip-"));
+  const inPath = path.join(tmpDir, "in.mp4");
+  const outPath = path.join(tmpDir, "out.mp4");
+  try {
+    const buf = await downloadWithRetry(source_video_url);
+    fs.writeFileSync(inPath, buf);
+
+    // Crop centered to target aspect ratio, then scale to canonical resolution.
+    let cropFilter, scaleFilter;
+    if (aspect_ratio === "9:16") {
+      cropFilter = "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'";
+      scaleFilter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
+    } else if (aspect_ratio === "1:1") {
+      cropFilter = "crop='min(iw,ih)':'min(iw,ih)'";
+      scaleFilter = "scale=1080:1080,setsar=1";
+    } else {
+      // 16:9
+      cropFilter = "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)'";
+      scaleFilter = "scale=1920:1080,setsar=1";
+    }
+
+    const start = Math.max(0, Number(start_seconds) || 0);
+    const dur = Math.max(1, Number(duration_seconds) || 30);
+
+    const args = [
+      "-y",
+      "-ss", String(start),
+      "-i", inPath,
+      "-t", String(dur),
+      "-vf", `${cropFilter},${scaleFilter},format=yuv420p`,
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "20",
+      "-c:a", "aac",
+      "-b:a", "128k",
+      "-movflags", "+faststart",
+      outPath,
+    ];
+    await runFfmpeg(args);
+
+    const actualDuration = await ffprobeDuration(outPath).catch(() => dur);
+
+    assertStorageConfigured();
+    const outBuf = fs.readFileSync(outPath);
+    const { error: upErr } = await supabase.storage
+      .from("generated-clips")
+      .upload(output_filename, outBuf, { contentType: "video/mp4", upsert: true });
+    if (upErr) throw new Error(`Storage upload: ${upErr.message}`);
+    const { data: pub } = supabase.storage.from("generated-clips").getPublicUrl(output_filename);
+    res.json({ ok: true, clip_url: pub.publicUrl, duration: actualDuration });
+  } catch (e) {
+    console.error("extract-clip failed", e);
+    res.status(500).json({ error: e.message || "extract failed" });
+  } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
