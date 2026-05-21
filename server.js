@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-signed-upload-v15";
+const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-letterbox-v16";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -562,18 +562,25 @@ app.post("/extract-clip", async (req, res) => {
     const buf = await downloadWithRetry(source_video_url);
     fs.writeFileSync(inPath, buf);
 
-    // Crop centered to target aspect ratio, then scale to canonical resolution.
-    let cropFilter, scaleFilter;
+    // Fit the full source frame into the target canvas with black bars
+    // (letterbox / pillarbox) instead of cropping. This preserves the entire
+    // scene — important because the source final video already has burned-in
+    // captions that a center crop would clip on the sides.
+    let vfChain;
     if (aspect_ratio === "9:16") {
-      cropFilter = "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'";
-      scaleFilter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
+      // 1080x1920 portrait, full landscape frame pillarboxed top + bottom.
+      vfChain =
+        "scale=1080:1920:force_original_aspect_ratio=decrease," +
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
     } else if (aspect_ratio === "1:1") {
-      cropFilter = "crop='min(iw,ih)':'min(iw,ih)'";
-      scaleFilter = "scale=1080:1080,setsar=1";
+      vfChain =
+        "scale=1080:1080:force_original_aspect_ratio=decrease," +
+        "pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
     } else {
       // 16:9
-      cropFilter = "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)'";
-      scaleFilter = "scale=1920:1080,setsar=1";
+      vfChain =
+        "scale=1920:1080:force_original_aspect_ratio=decrease," +
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
     }
 
     const start = Math.max(0, Number(start_seconds) || 0);
@@ -584,7 +591,7 @@ app.post("/extract-clip", async (req, res) => {
       "-ss", String(start),
       "-i", inPath,
       "-t", String(dur),
-      "-vf", `${cropFilter},${scaleFilter},format=yuv420p`,
+      "-vf", `${vfChain},format=yuv420p`,
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "20",
