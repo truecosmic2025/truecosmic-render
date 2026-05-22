@@ -540,7 +540,7 @@ app.post("/probe-media", async (req, res) => {
  * Body: { source_video_url, start_seconds, duration_seconds, output_filename, aspect_ratio="9:16", upload_url?, public_url? }
  * Cuts a sub-clip from a source video, center-crops to the requested aspect ratio
   * (default 9:16 -> 1080x1920), re-encodes, uploads via signed upload URL
-  * when provided (legacy bucket upload fallback), and returns { clip_url, duration }.
+ * when provided (legacy bucket upload fallback), and returns { clip_url, duration }.
  */
 app.post("/extract-clip", async (req, res) => {
   const {
@@ -634,14 +634,17 @@ app.post("/extract-clip", async (req, res) => {
       const BOTTOM_BAR_H = 656;
       const SAFE_W = 1080 - 2 * 40; // 40px padding each side → 1000px usable
 
-      // Top bar uses the logo overlay (added later via filter_complex) when
-      // hasLogo is true. Otherwise fall back to text.
-      if (!hasLogo && top_text && String(top_text).trim()) {
+      // Top bar: always burn the per-clip hook. When a logo is present it sits
+      // higher in the bar and the hook renders underneath it.
+      if (top_text && String(top_text).trim()) {
         const { text, fontsize } = fitTextToWidth(top_text, 64, 36, SAFE_W);
+        const yPos = hasLogo
+          ? 80 + 180 + 40 // logo top (80) + logo height (180) + gap (40)
+          : Math.round(TOP_BAR_H / 2 - fontsize / 2);
         drawtextParts.push(
           `drawtext=fontfile='${fontFile}':text='${escapeDrawText(text)}'` +
             `:fontcolor=white:fontsize=${fontsize}:borderw=3:bordercolor=black` +
-            `:x=(w-text_w)/2:y=${Math.round(TOP_BAR_H / 2 - fontsize / 2)}`,
+            `:x=(w-text_w)/2:y=${yPos}`,
         );
       }
       if (bottom_text && String(bottom_text).trim()) {
@@ -662,9 +665,10 @@ app.post("/extract-clip", async (req, res) => {
 
     const args = ["-y", "-ss", String(start), "-i", inPath, "-t", String(dur)];
     if (hasLogo) {
-      // Logo centered in the top letterbox bar (656px tall starting at y=0).
-      const LOGO_H = 360;
-      const LOGO_Y = Math.max(20, Math.round((656 - LOGO_H) / 2));
+      // Logo sits in the upper portion of the 656px top bar so the hook text
+      // (drawn via vfChain above) has room to render directly underneath it.
+      const LOGO_H = 180;
+      const LOGO_Y = 80;
       args.push("-i", logoPath);
       const filterComplex =
         `[0:v]${vfChain}[bg];` +
