@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-21-extract-clip-letterbox-v18-emoji";
+const RENDER_SERVER_VERSION = "2026-05-22-extract-clip-letterbox-v20-logo-overlay";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -553,8 +553,7 @@ app.post("/extract-clip", async (req, res) => {
     public_url,
     top_text,
     bottom_text,
-    top_emoji,
-    bottom_emoji,
+    top_logo_url,
   } = req.body || {};
   if (!source_video_url || !output_filename || !duration_seconds) {
     return res.status(400).json({ error: "source_video_url, duration_seconds, output_filename required" });
@@ -563,9 +562,20 @@ app.post("/extract-clip", async (req, res) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clip-"));
   const inPath = path.join(tmpDir, "in.mp4");
   const outPath = path.join(tmpDir, "out.mp4");
+  const logoPath = path.join(tmpDir, "logo.png");
   try {
     const buf = await downloadWithRetry(source_video_url);
     fs.writeFileSync(inPath, buf);
+
+    let hasLogo = false;
+    if (top_logo_url && aspect_ratio === "9:16") {
+      try {
+        const lbuf = await downloadWithRetry(top_logo_url, { attempts: 2, timeoutMs: 20000 });
+        if (lbuf?.length) { fs.writeFileSync(logoPath, lbuf); hasLogo = true; }
+      } catch (e) {
+        console.warn("top_logo_url download failed, falling back to text:", e.message);
+      }
+    }
 
     // Fit the full source frame into the target canvas with black bars
     // (letterbox / pillarbox) instead of cropping. This preserves the entire
@@ -592,51 +602,54 @@ app.post("/extract-clip", async (req, res) => {
     // that's the path that produces meaningful empty bars from a 16:9 source).
     // Source final video is 1920x1080 -> scaled to 1080x607.5 inside 1080x1920,
     // leaving ~656px black bars top and bottom.
+    // Sanitize text for drawtext filter (FFmpeg escaping rules).
     const escapeDrawText = (s) =>
       String(s)
         .replace(/\\/g, "\\\\")
         .replace(/:/g, "\\:")
         .replace(/'/g, "\\\\\\'")
         .replace(/%/g, "\\%");
+
+    // Auto-fit a line to a max pixel width by shrinking the font size and
+    // truncating with an ellipsis as a last resort. DejaVu Sans Bold averages
+    // roughly fontsize * 0.55 px per character.
+    const fitTextToWidth = (text, startSize, minSize, maxPxWidth) => {
+      const t = String(text || "").trim();
+      if (!t) return { text: "", fontsize: startSize };
+      for (let fs = startSize; fs >= minSize; fs -= 2) {
+        const avg = fs * 0.55;
+        const fits = t.length * avg <= maxPxWidth;
+        if (fits) return { text: t, fontsize: fs };
+      }
+      // Truncate at minSize.
+      const avg = minSize * 0.55;
+      const maxChars = Math.max(1, Math.floor(maxPxWidth / avg) - 1);
+      return { text: t.slice(0, maxChars - 1).trimEnd() + "…", fontsize: minSize };
+    };
     const fontFile = CAPTIONS_FONT_FILE;
-    const emojiFontFile = EMOJI_FONT_FILE;
     const drawtextParts = [];
     if (aspect_ratio === "9:16") {
       const TOP_BAR_H = 656;       // (1920 - 608) / 2, rounded
       const BOTTOM_BAR_Y = 1264;   // 1920 - 656
       const BOTTOM_BAR_H = 656;
+      const SAFE_W = 1080 - 2 * 40; // 40px padding each side → 1000px usable
 
-      // Top bar: emoji on its own line (rendered with NotoColorEmoji so the
-      // color glyph shows), then the bold text line below it. We stack them
-      // so we don't have to know either glyph's width.
-      if (top_emoji && String(top_emoji).trim()) {
+      // Top bar uses the logo overlay (added later via filter_complex) when
+      // hasLogo is true. Otherwise fall back to text.
+      if (!hasLogo && top_text && String(top_text).trim()) {
+        const { text, fontsize } = fitTextToWidth(top_text, 64, 36, SAFE_W);
         drawtextParts.push(
-          `drawtext=fontfile='${emojiFontFile}':text='${escapeDrawText(top_emoji)}'` +
-            `:fontcolor=white:fontsize=109` +  // NotoColorEmoji is a bitmap font; 109 is its native size
-            `:x=(w-text_w)/2:y=${Math.round(TOP_BAR_H / 2 - 110)}`,
+          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(text)}'` +
+            `:fontcolor=white:fontsize=${fontsize}:borderw=3:bordercolor=black` +
+            `:x=(w-text_w)/2:y=${Math.round(TOP_BAR_H / 2 - fontsize / 2)}`,
         );
       }
-      if (top_text && String(top_text).trim()) {
-        drawtextParts.push(
-          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(top_text)}'` +
-            `:fontcolor=white:fontsize=64:borderw=3:bordercolor=black` +
-            `:x=(w-text_w)/2:y=${Math.round(TOP_BAR_H / 2 + 30)}`,
-        );
-      }
-      // Bottom bar: text on top line, emoji centered below it.
       if (bottom_text && String(bottom_text).trim()) {
+        const { text, fontsize } = fitTextToWidth(bottom_text, 52, 32, SAFE_W);
         drawtextParts.push(
-          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(bottom_text)}'` +
-            `:fontcolor=white:fontsize=56:borderw=3:bordercolor=black` +
-            `:x=(w-text_w)/2:y=${BOTTOM_BAR_Y + Math.round(BOTTOM_BAR_H / 2 - 90)}` +
-            `:line_spacing=10`,
-        );
-      }
-      if (bottom_emoji && String(bottom_emoji).trim()) {
-        drawtextParts.push(
-          `drawtext=fontfile='${emojiFontFile}':text='${escapeDrawText(bottom_emoji)}'` +
-            `:fontcolor=white:fontsize=109` +
-            `:x=(w-text_w)/2:y=${BOTTOM_BAR_Y + Math.round(BOTTOM_BAR_H / 2 + 10)}`,
+          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(text)}'` +
+            `:fontcolor=white:fontsize=${fontsize}:borderw=3:bordercolor=black` +
+            `:x=(w-text_w)/2:y=${BOTTOM_BAR_Y + Math.round(BOTTOM_BAR_H / 2 - fontsize / 2)}`,
         );
       }
     }
@@ -647,12 +660,25 @@ app.post("/extract-clip", async (req, res) => {
     const start = Math.max(0, Number(start_seconds) || 0);
     const dur = Math.max(1, Number(duration_seconds) || 30);
 
-    const args = [
-      "-y",
-      "-ss", String(start),
-      "-i", inPath,
-      "-t", String(dur),
-      "-vf", `${vfChain},format=yuv420p`,
+    const args = ["-y", "-ss", String(start), "-i", inPath, "-t", String(dur)];
+    if (hasLogo) {
+      // Logo centered in the top letterbox bar (656px tall starting at y=0).
+      const LOGO_H = 360;
+      const LOGO_Y = Math.max(20, Math.round((656 - LOGO_H) / 2));
+      args.push("-i", logoPath);
+      const filterComplex =
+        `[0:v]${vfChain}[bg];` +
+        `[1:v]scale=-1:${LOGO_H}:flags=lanczos[lg];` +
+        `[bg][lg]overlay=(W-w)/2:${LOGO_Y}:format=auto,format=yuv420p[outv]`;
+      args.push(
+        "-filter_complex", filterComplex,
+        "-map", "[outv]",
+        "-map", "0:a?",
+      );
+    } else {
+      args.push("-vf", `${vfChain},format=yuv420p`);
+    }
+    args.push(
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "20",
@@ -660,7 +686,7 @@ app.post("/extract-clip", async (req, res) => {
       "-b:a", "128k",
       "-movflags", "+faststart",
       outPath,
-    ];
+    );
     await runFfmpeg(args);
 
     const actualDuration = await ffprobeDuration(outPath).catch(() => dur);
