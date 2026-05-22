@@ -31,12 +31,13 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-22-extract-clip-letterbox-v20-logo-overlay";
+const RENDER_SERVER_VERSION = "2026-05-22-extract-clip-letterbox-v21-emoji-caption-burn";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
 const CAPTIONS_HIGHLIGHT_BGR = process.env.CAPTIONS_HIGHLIGHT_BGR || "FF309B"; // #9B30FF (BBGGRR)
 const CAPTIONS_FONT_FILE = process.env.CAPTIONS_FONT_FILE || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+const CAPTIONS_FONT_NAME = process.env.CAPTIONS_FONT_NAME || "DejaVu Sans";
 const EMOJI_FONT_FILE = process.env.EMOJI_FONT_FILE || "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
 
 function resolveFfmpegBinary() {
@@ -610,6 +611,44 @@ app.post("/extract-clip", async (req, res) => {
         .replace(/'/g, "\\\\\\'")
         .replace(/%/g, "\\%");
 
+    const escapeAssInlineText = (s) =>
+      String(s || "")
+        .replace(/\\/g, "\\\\")
+        .replace(/\{/g, "\\{")
+        .replace(/\}/g, "\\}")
+        .replace(/\r?\n/g, " ");
+
+    const buildStaticAssOverlay = (overlays, { width = 1080, height = 1920 }) => {
+      const header = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        `PlayResX: ${width}`,
+        `PlayResY: ${height}`,
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        `Style: Brand,${CAPTIONS_FONT_NAME},48,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,5,40,40,0,1`,
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+      ];
+
+      const events = overlays
+        .filter((o) => o?.text)
+        .map((o) => {
+          const fontsize = Math.round(o.fontsize || 48);
+          const x = Math.round(o.x || width / 2);
+          const y = Math.round(o.y || height / 2);
+          const outline = Math.round(o.outline || 3);
+          const text = escapeAssInlineText(o.text);
+          return `Dialogue: 1,0:00:00.00,9:59:59.99,Brand,,0,0,0,,{\\an5\\fs${fontsize}\\bord${outline}\\pos(${x},${y})}${text}`;
+        });
+
+      return `${header.concat(events).join("\n")}\n`;
+    };
+
     // Auto-fit a line to a max pixel width by shrinking the font size and
     // truncating with an ellipsis as a last resort. DejaVu Sans Bold averages
     // roughly fontsize * 0.55 px per character.
@@ -628,6 +667,7 @@ app.post("/extract-clip", async (req, res) => {
     };
     const fontFile = CAPTIONS_FONT_FILE;
     const drawtextParts = [];
+    const assOverlayParts = [];
     if (aspect_ratio === "9:16") {
       const TOP_BAR_H = 656;       // (1920 - 608) / 2, rounded
       const BOTTOM_BAR_Y = 1264;   // 1920 - 656
@@ -641,23 +681,30 @@ app.post("/extract-clip", async (req, res) => {
         const yPos = hasLogo
           ? 80 + 180 + 40 // logo top (80) + logo height (180) + gap (40)
           : Math.round(TOP_BAR_H / 2 - fontsize / 2);
-        drawtextParts.push(
-          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(text)}'` +
-            `:fontcolor=white:fontsize=${fontsize}:borderw=3:bordercolor=black` +
-            `:x=(w-text_w)/2:y=${yPos}`,
-        );
+        assOverlayParts.push({ text, fontsize, x: 540, y: yPos + Math.round(fontsize / 2), outline: 3 });
       }
       if (bottom_text && String(bottom_text).trim()) {
         const { text, fontsize } = fitTextToWidth(bottom_text, 52, 32, SAFE_W);
-        drawtextParts.push(
-          `drawtext=fontfile='${fontFile}':text='${escapeDrawText(text)}'` +
-            `:fontcolor=white:fontsize=${fontsize}:borderw=3:bordercolor=black` +
-            `:x=(w-text_w)/2:y=${BOTTOM_BAR_Y + Math.round(BOTTOM_BAR_H / 2 - fontsize / 2)}`,
-        );
+        assOverlayParts.push({
+          text,
+          fontsize,
+          x: 540,
+          y: BOTTOM_BAR_Y + Math.round(BOTTOM_BAR_H / 2),
+          outline: 3,
+        });
       }
     }
     if (drawtextParts.length) {
       vfChain = `${vfChain},${drawtextParts.join(",")}`;
+    }
+    if (assOverlayParts.length) {
+      const assOverlayPath = path.join(tmpDir, "brand-overlay.ass");
+      fs.writeFileSync(assOverlayPath, buildStaticAssOverlay(assOverlayParts), "utf8");
+      const escapedAssOverlayPath = assOverlayPath
+        .replace(/\\/g, "/")
+        .replace(/:/g, "\\:")
+        .replace(/'/g, "\\'");
+      vfChain = `${vfChain},ass='${escapedAssOverlayPath}'`;
     }
 
     const start = Math.max(0, Number(start_seconds) || 0);
