@@ -1370,8 +1370,84 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
     await burnCaptionsIntoVideo(srcPath, burnedPath, assPath, words, tmpDir);
     captionSource = `${captionSource}+ass-karaoke`;
 
+    // ===== Brand intro/outro =====
+    // Permanent system rule: every final video is wrapped with the user's
+    // brand intro (prepended) and outro (appended) when they have uploaded
+    // them in Settings → Brand Assets. Each clip is normalized to the same
+    // WxH / 25fps / yuv420p / stereo AAC profile, then concat-demuxed with
+    // the captioned body so audio (intro music, outro music) stays intact.
+    let finalPath = burnedPath;
+    const introOutroUrls = [
+      { kind: "intro", url: body.intro_url },
+      { kind: "outro", url: body.outro_url },
+    ].filter((x) => typeof x.url === "string" && x.url.length > 0);
+    if (introOutroUrls.length > 0) {
+      onProgress({ stage: "branding", progress: 85, message: "Adding brand intro/outro…" });
+      async function normalizeBrandClip(url, label) {
+        const dlPath = path.join(tmpDir, `${label}-src.mp4`);
+        await downloadToFile(url, dlPath, `${label} video`);
+        const normPath = path.join(tmpDir, `${label}-norm.mp4`);
+        const vf =
+          `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+          `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p`;
+        await runFfmpeg([
+          "-y",
+          "-fflags", "+genpts+discardcorrupt",
+          "-err_detect", "ignore_err",
+          "-i", dlPath,
+          "-vf", vf,
+          "-af", "aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo",
+          "-c:v", "libx264",
+          "-preset", "veryfast",
+          "-crf", "20",
+          "-r", "25",
+          "-pix_fmt", "yuv420p",
+          "-c:a", "aac",
+          "-b:a", "192k",
+          "-ar", "44100",
+          "-ac", "2",
+          "-movflags", "+faststart",
+          normPath,
+        ]);
+        return normPath;
+      }
+      // Body needs to share the same audio profile so concat demuxer is stable.
+      const bodyNormPath = path.join(tmpDir, "body-norm.mp4");
+      await runFfmpeg([
+        "-y",
+        "-i", burnedPath,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-movflags", "+faststart",
+        bodyNormPath,
+      ]);
+      const parts = [];
+      const introUrl = body.intro_url;
+      const outroUrl = body.outro_url;
+      if (introUrl) parts.push(await normalizeBrandClip(introUrl, "intro"));
+      parts.push(bodyNormPath);
+      if (outroUrl) parts.push(await normalizeBrandClip(outroUrl, "outro"));
+      const brandConcatList = path.join(tmpDir, "brand.ffconcat");
+      fs.writeFileSync(brandConcatList, parts.map(ffconcatLine).join("\n") + "\n", "utf8");
+      const brandedPath = path.join(tmpDir, "branded.mp4");
+      await runFfmpeg([
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", brandConcatList,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        brandedPath,
+      ]);
+      finalPath = brandedPath;
+      console.log(`Wrapped final video with brand assets: intro=${Boolean(introUrl)}, outro=${Boolean(outroUrl)}`);
+    }
+
     onProgress({ stage: "uploading", progress: 92, message: "Uploading captioned video…" });
-    const outBuf = fs.readFileSync(burnedPath);
+    const outBuf = fs.readFileSync(finalPath);
     const putRes = await fetch(uploadUrl, {
       method: "PUT",
       headers: { "Content-Type": "video/mp4", "x-upsert": "true" },
