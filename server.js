@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-05-22-extract-clip-letterbox-v21-emoji-caption-burn";
+const RENDER_SERVER_VERSION = "2026-06-06-per-scene-sync-fix-v1";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -915,7 +915,7 @@ function formatAssTime(t) {
   const m = Math.floor((t % 3600) / 60);
   const s = Math.floor(t % 60);
   const cs = Math.floor((t - Math.floor(t)) * 100);
-  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "00")}`;
 }
 
 function escapeAssText(t) {
@@ -1505,7 +1505,8 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
         await downloadToFile(narrationItems[i].url, dest, `narration ${i + 1}`);
         narrationPaths.push(dest);
       } catch (e) {
-        console.warn("narration fetch", narrationItems[i].url, e.message);
+        console.warn(`narration fetch FAILED for scene ${i + 1}`, narrationItems[i].url, e.message);
+        narrationPaths.push(null); // keep index aligned with clip index
       }
     }
 
@@ -1547,11 +1548,13 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       }
     }
 
+    // Build narration track from successfully downloaded files only (nulls filtered out)
+    const validNarrationPaths = narrationPaths.filter(Boolean);
     let narrationTrackPath = null;
-    if (narrationPaths.length > 1) {
+    if (validNarrationPaths.length > 1) {
       const narrationListPath = path.join(tmpDir, "narrations.ffconcat");
       narrationTrackPath = path.join(tmpDir, "narration-track.m4a");
-      fs.writeFileSync(narrationListPath, narrationPaths.map(ffconcatLine).join("\n") + "\n", "utf8");
+      fs.writeFileSync(narrationListPath, validNarrationPaths.map(ffconcatLine).join("\n") + "\n", "utf8");
       await runFfmpeg([
         "-y",
         "-f", "concat",
@@ -1564,11 +1567,13 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
         "-b:a", "192k",
         narrationTrackPath,
       ]);
-    } else if (narrationPaths.length === 1) {
-      narrationTrackPath = narrationPaths[0];
+    } else if (validNarrationPaths.length === 1) {
+      narrationTrackPath = validNarrationPaths[0];
     }
 
-    const narrationDurations = await Promise.all(narrationPaths.map((p) => ffprobeDuration(p)));
+    const narrationDurations = await Promise.all(
+      narrationPaths.map((p) => (p ? ffprobeDuration(p) : Promise.resolve(null)))
+    );
     const narrationDuration = narrationDurations.reduce((sum, d) => sum + (d || 0), 0);
 
     const requestedClipDurations = normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
@@ -1577,8 +1582,12 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     // Per-scene image/narration sync: when we receive one narration per clip
     // (matching scene order), retime each clip to exactly its narration's
     // duration so images stay on screen as long as the voice over plays.
+    // FIX: validNarrationCount must equal localPaths.length — null placeholders
+    // (failed downloads) now keep the array index aligned but don't count as valid.
+    const validNarrationCount = narrationPaths.filter(Boolean).length;
     const perSceneSync =
       narrationPaths.length === localPaths.length &&
+      validNarrationCount === localPaths.length &&
       narrationPaths.length > 1 &&
       narrationDurations.every((d) => typeof d === "number" && d > 0);
     const explicitDurationSync =
@@ -1598,8 +1607,11 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       localPaths.length > 1;
     const weightedDurations = weightedDurationSync ? fitDurationsToTotal(requestedClipWeights, narrationDuration) : [];
     const stretchedDurations = stretchClipsToNarration ? fitDurationsToTotal(durations, narrationDuration) : [];
+
+    console.log(`[SYNC] clips=${localPaths.length} narrations=${narrationPaths.length} valid=${validNarrationCount} perSceneSync=${perSceneSync} narrationDuration=${narrationDuration.toFixed(2)}s`);
+
     const clipTargetDurations = localPaths.map((_, i) => {
-      if (perSceneSync) return narrationDurations[i];
+      if (perSceneSync) return narrationDurations[i] || durations[i] || 5;
       if (explicitDurationSync) return requestedClipDurations[i];
       if (weightedDurationSync) return weightedDurations[i] || durations[i] || 5;
       if (stretchClipsToNarration) return stretchedDurations[i] || durations[i] || 5;
@@ -1784,7 +1796,7 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     const captionsTag = captionedPath !== outPath ? `burned:${captionSource}` : captionSource;
     const meta = {
       clip_count: n,
-      narration_count: narrationPaths.length,
+      narration_count: validNarrationCount,
       sfx_count: sfxPaths.length,
       has_music: Boolean(musicPath),
       captions: captionsTag,
