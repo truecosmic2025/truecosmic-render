@@ -699,7 +699,9 @@ app.post("/extract-clip", async (req, res) => {
     }
     if (assOverlayParts.length) {
       const assOverlayPath = path.join(tmpDir, "brand-overlay.ass");
-      fs.writeFileSync(assOverlayPath, buildStaticAssOverlay(assOverlayParts), "utf8");
+      const _assW = aspect_ratio === "1:1" ? 1080 : aspect_ratio === "16:9" ? 1920 : 1080;
+       const _assH = aspect_ratio === "1:1" ? 1080 : aspect_ratio === "16:9" ? 1080 : 1920;
+       fs.writeFileSync(assOverlayPath, buildStaticAssOverlay(assOverlayParts, { width: _assW, height: _assH }), "utf8");
       const escapedAssOverlayPath = assOverlayPath
         .replace(/\\/g, "/")
         .replace(/:/g, "\\:")
