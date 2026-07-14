@@ -31,11 +31,11 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-06-06-per-scene-sync-fix-v1";
+const RENDER_SERVER_VERSION = "2026-07-14-portrait-shorts-render-lock-v26";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
-const CAPTIONS_HIGHLIGHT_BGR = process.env.CAPTIONS_HIGHLIGHT_BGR || "FF309B"; // #9B30FF (BBGGRR)
+const CAPTIONS_HIGHLIGHT_BGR = process.env.CAPTIONS_HIGHLIGHT_BGR || "FF4FB4"; // #B44FFF (BBGGRR) — brand bright purple
 const CAPTIONS_FONT_FILE = process.env.CAPTIONS_FONT_FILE || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
 const CAPTIONS_FONT_NAME = process.env.CAPTIONS_FONT_NAME || "DejaVu Sans";
 const EMOJI_FONT_FILE = process.env.EMOJI_FONT_FILE || "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
@@ -72,6 +72,33 @@ function resolveFfprobeBinary() {
   }
 
   return "ffprobe";
+}
+
+// ==========================================================================
+// Motion library — varied per-image Ken Burns motion.
+// Rotated by scene index so no two adjacent stills share the same motion.
+// Applies to both portrait (1080x1920) and landscape (1920x1080) renders.
+// ==========================================================================
+const MOTION_LIBRARY = [
+  { name: "zoom-in",         filter: (d, s) => `zoompan=z='min(zoom+0.0015,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "zoom-out",        filter: (d, s) => `zoompan=z='if(lte(zoom,1.0),1.15,max(1.0,zoom-0.0015))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "pan-left",        filter: (d, s) => `zoompan=z=1.08:x='iw/zoom/2+((iw-iw/zoom)*on/${Math.round(d*25)})':y='ih/2-(ih/zoom/2)':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "pan-right",       filter: (d, s) => `zoompan=z=1.08:x='(iw-iw/zoom)*on/${Math.round(d*25)}':y='ih/2-(ih/zoom/2)':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "pan-up",          filter: (d, s) => `zoompan=z=1.08:x='iw/2-(iw/zoom/2)':y='ih/zoom/2+((ih-ih/zoom)*on/${Math.round(d*25)})':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "pan-down",        filter: (d, s) => `zoompan=z=1.08:x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*on/${Math.round(d*25)}':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "zoom-in-top",     filter: (d, s) => `zoompan=z='min(zoom+0.0015,1.15)':x='iw/2-(iw/zoom/2)':y=0:d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "zoom-in-bottom",  filter: (d, s) => `zoompan=z='min(zoom+0.0015,1.15)':x='iw/2-(iw/zoom/2)':y='ih-ih/zoom':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "diagonal-drift",  filter: (d, s) => `zoompan=z=1.08:x='(iw-iw/zoom)*on/${Math.round(d*25)}':y='(ih-ih/zoom)*on/${Math.round(d*25)}':d=${Math.round(d*25)}:s=${s}:fps=25` },
+  { name: "breathe",         filter: (d, s) => `zoompan=z='1.0+0.008*sin(2*3.14159*on/${Math.round(d*25)})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(d*25)}:s=${s}:fps=25` },
+];
+// Non-consecutive rotation order — no two adjacent scenes share a motion.
+const MOTION_ROTATION = [0, 2, 1, 4, 3, 8, 5, 6, 9, 7, 0, 4, 2, 5, 1, 3, 8, 6, 9, 7];
+
+function getMotionFilter(sceneIndex, durationSec, orientation) {
+  const dims = orientation === "portrait" ? "1080x1920" : "1920x1080";
+  const d = Math.max(1, Math.round(Number(durationSec) || 5));
+  const idx = MOTION_ROTATION[Math.abs(Number(sceneIndex) || 0) % MOTION_ROTATION.length];
+  return MOTION_LIBRARY[idx].filter(d, dims);
 }
 
 let supabase = null;
@@ -190,24 +217,30 @@ function ffmpegVersion() {
  * FFmpeg zoompan filters per effect.
  * d=125 = 5 seconds at 25fps. We override `d` based on requested duration.
  */
-function buildZoompan(effect, durationSec) {
+function buildZoompan(effect, durationSec, orientation = "landscape") {
+  const dims = orientation === "portrait" ? "1080x1920" : "1920x1080";
+  const motion = MOTION_LIBRARY.find((item) => item.name === effect);
+  if (motion) return motion.filter(Math.max(1, Number(durationSec) || 5), dims);
+
   const d = Math.max(1, Math.round(durationSec * 25));
   switch (effect) {
     case "zoom-in":
       // Slower, gentler push-in. Caps at 1.15x so framing stays close to the original.
-      return `zoompan=z='min(zoom+0.0006,1.15)':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      return `zoompan=z='min(zoom+0.0006,1.15)':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${dims}:fps=25`;
     case "zoom-out":
       // Start slightly zoomed-in (1.15x) and ease back to 1.0x for a calm reveal.
-      return `zoompan=z='if(lte(zoom,1.0),1.15,max(1.0,zoom-0.0006))':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      return `zoompan=z='if(lte(zoom,1.0),1.15,max(1.0,zoom-0.0006))':d=${d}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${dims}:fps=25`;
     case "pan-left":
       // Gentle horizontal pan at a lighter 1.1x crop.
-      return `zoompan=z='1.1':d=${d}:x='iw/3+(iw/6*(on/${d}))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      return `zoompan=z='1.1':d=${d}:x='iw/3+(iw/6*(on/${d}))':y='ih/2-(ih/zoom/2)':s=${dims}:fps=25`;
     case "pan-right":
-      return `zoompan=z='1.1':d=${d}:x='iw-(iw/3+(iw/6*(on/${d})))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      return `zoompan=z='1.1':d=${d}:x='iw-(iw/3+(iw/6*(on/${d})))':y='ih/2-(ih/zoom/2)':s=${dims}:fps=25`;
     case "diagonal":
-      return `zoompan=z='min(zoom+0.0005,1.12)':d=${d}:x='iw/8*(on/${d})':y='ih/8*(on/${d})':s=1920x1080:fps=25`;
+      return `zoompan=z='min(zoom+0.0005,1.12)':d=${d}:x='iw/8*(on/${d})':y='ih/8*(on/${d})':s=${dims}:fps=25`;
     case "zoom-drift":
-      return `zoompan=z='min(zoom+0.0008,1.18)':d=${d}:x='iw/2-(iw/zoom/2)+(10*(on/${d}))':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=25`;
+      return `zoompan=z='min(zoom+0.0008,1.18)':d=${d}:x='iw/2-(iw/zoom/2)+(10*(on/${d}))':y='ih/2-(ih/zoom/2)':s=${dims}:fps=25`;
+    case "auto":
+      return getMotionFilter(0, durationSec, orientation);
     default:
       throw new Error(`Unknown effect: ${effect}`);
   }
@@ -317,6 +350,30 @@ function normalizeDurationList(input) {
       return NaN;
     })
     .map((n) => (Number.isFinite(n) && n > 0 ? n : null));
+}
+
+function isShortPortraitPayload(body, clipCount, targetAspect) {
+  const explicitShort = body?.shorts_mode === true || body?.is_shorts === true || body?.force_short_form === true;
+  const requestedTarget = Number(body?.target_duration_seconds ?? body?.target_duration ?? 0);
+  return targetAspect === "9:16" && (explicitShort || requestedTarget <= 180 || clipCount >= 30);
+}
+
+function shortSceneDuration(body, fallback = 2.5) {
+  const value = Number(body?.short_scene_duration ?? body?.scene_duration_seconds ?? body?.clip_duration_seconds);
+  if (Number.isFinite(value) && value > 0) return Math.max(0.5, Math.min(10, value));
+  return fallback;
+}
+
+function fitClipToCanvasFilter(W, H, isPortrait) {
+  // Portrait shorts must fill the 9:16 phone frame. The old "decrease + pad"
+  // route made landscape clips appear as small postcard boxes. For portrait
+  // outputs we crop/fill instead; if a legacy landscape clip slips through,
+  // this removes the black/postbox look rather than preserving it.
+  const mode = isPortrait ? "increase" : "decrease";
+  const tail = isPortrait
+    ? `crop=${W}:${H}`
+    : `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black`;
+  return `scale=${W}:${H}:force_original_aspect_ratio=${mode},${tail},setsar=1,fps=25,format=yuv420p`;
 }
 
 function normalizeCaptionItems(input) {
@@ -432,9 +489,9 @@ function normalizeNarrationItems(body) {
 }
 
 app.post("/ken-burns", async (req, res) => {
-  const { image_url, duration = 10, output_filename, effect, music_url, music_volume = 0.15, return_binary = false } = req.body || {};
-  if (!image_url || !effect || (!return_binary && !output_filename)) {
-    return res.status(400).json({ error: "image_url, effect, and output_filename required unless return_binary=true" });
+  const { image_url, duration = 10, output_filename, effect, scene_index, orientation, music_url, music_volume = 0.15, return_binary = false } = req.body || {};
+  if (!image_url || (!return_binary && !output_filename)) {
+    return res.status(400).json({ error: "image_url and output_filename required unless return_binary=true" });
   }
   let binaryResponseInProgress = false;
 
@@ -451,8 +508,14 @@ app.post("/ken-burns", async (req, res) => {
     const buf = await downloadWithRetry(image_url);
     fs.writeFileSync(inPath, buf);
 
-    const dur = Math.max(1, parseInt(duration, 10) || 10);
-    const zoompan = buildZoompan(effect, dur);
+    const dur = Math.max(1, Number(duration) || 10);
+    // Prefer the varied motion library (rotated per scene_index). Only fall
+    // back to the legacy fixed-effect map when the caller pins a specific
+    // effect AND does not supply a scene_index for rotation.
+    const useLibrary = (typeof scene_index === "number") || !effect || effect === "auto";
+    const zoompan = useLibrary
+      ? getMotionFilter(scene_index ?? 0, dur, orientation)
+      : buildZoompan(effect, dur, orientation);
 
     let hasMusic = false;
     if (music_url) {
@@ -541,7 +604,7 @@ app.post("/probe-media", async (req, res) => {
  * Body: { source_video_url, start_seconds, duration_seconds, output_filename, aspect_ratio="9:16", upload_url?, public_url? }
  * Cuts a sub-clip from a source video, center-crops to the requested aspect ratio
   * (default 9:16 -> 1080x1920), re-encodes, uploads via signed upload URL
- * when provided (legacy bucket upload fallback), and returns { clip_url, duration }.
+  * when provided (legacy bucket upload fallback), and returns { clip_url, duration }.
  */
 app.post("/extract-clip", async (req, res) => {
   const {
@@ -578,13 +641,10 @@ app.post("/extract-clip", async (req, res) => {
       }
     }
 
-    // Fit the full source frame into the target canvas with black bars
-    // (letterbox / pillarbox) instead of cropping. This preserves the entire
-    // scene — important because the source final video already has burned-in
-    // captions that a center crop would clip on the sides.
+    // Fit clips into the target canvas. Portrait source should fill the phone
+    // frame; only true landscape source may letterbox.
     let vfChain;
     if (aspect_ratio === "9:16") {
-      // 1080x1920 portrait, full landscape frame pillarboxed top + bottom.
       vfChain =
         "scale=1080:1920:force_original_aspect_ratio=decrease," +
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
@@ -599,10 +659,8 @@ app.post("/extract-clip", async (req, res) => {
         "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1";
     }
 
-    // Burn branded text into the top/bottom letterbox bars (9:16 only —
-    // that's the path that produces meaningful empty bars from a 16:9 source).
-    // Source final video is 1920x1080 -> scaled to 1080x607.5 inside 1080x1920,
-    // leaving ~656px black bars top and bottom.
+    // Burn branded text into top/bottom bars for highlight reels only. The
+    // normal final-video path does not use this endpoint.
     // Sanitize text for drawtext filter (FFmpeg escaping rules).
     const escapeDrawText = (s) =>
       String(s)
@@ -618,7 +676,7 @@ app.post("/extract-clip", async (req, res) => {
         .replace(/\}/g, "\\}")
         .replace(/\r?\n/g, " ");
 
-    const buildStaticAssOverlay = (overlays, { width = 1080, height = 1920 }) => {
+    const buildStaticAssOverlay = (overlays, { width = 1080, height = 1920 } = {}) => {
       const header = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -699,9 +757,7 @@ app.post("/extract-clip", async (req, res) => {
     }
     if (assOverlayParts.length) {
       const assOverlayPath = path.join(tmpDir, "brand-overlay.ass");
-      const _assW = aspect_ratio === "1:1" ? 1080 : aspect_ratio === "16:9" ? 1920 : 1080;
-       const _assH = aspect_ratio === "1:1" ? 1080 : aspect_ratio === "16:9" ? 1080 : 1920;
-       fs.writeFileSync(assOverlayPath, buildStaticAssOverlay(assOverlayParts, { width: _assW, height: _assH }), "utf8");
+      fs.writeFileSync(assOverlayPath, buildStaticAssOverlay(assOverlayParts), "utf8");
       const escapedAssOverlayPath = assOverlayPath
         .replace(/\\/g, "/")
         .replace(/:/g, "\\:")
@@ -712,7 +768,11 @@ app.post("/extract-clip", async (req, res) => {
     const start = Math.max(0, Number(start_seconds) || 0);
     const dur = Math.max(1, Number(duration_seconds) || 30);
 
-    const args = ["-y", "-ss", String(start), "-i", inPath, "-t", String(dur)];
+    // Keep -t with the source video input. When a logo overlay is added as a
+    // second input, placing -t after the first -i makes FFmpeg apply it to the
+    // logo input instead, so the exported "clip" becomes the full remaining
+    // 5–6 minute video.
+    const args = ["-y", "-ss", String(start), "-t", String(dur), "-i", inPath];
     if (hasLogo) {
       // Logo sits in the upper portion of the 656px top bar so the hook text
       // (drawn via vfChain above) has room to render directly underneath it.
@@ -732,6 +792,7 @@ app.post("/extract-clip", async (req, res) => {
       args.push("-vf", `${vfChain},format=yuv420p`);
     }
     args.push(
+      "-t", String(dur),
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "20",
@@ -917,7 +978,7 @@ function formatAssTime(t) {
   const m = Math.floor((t % 3600) / 60);
   const s = Math.floor(t % 60);
   const cs = Math.floor((t - Math.floor(t)) * 100);
-  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "00")}`;
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
 }
 
 function escapeAssText(t) {
@@ -933,14 +994,18 @@ function chunkWords(words, maxWords = 7) {
   return chunks;
 }
 
-function chunkWordsByTime(words, { maxWords = 6, maxDurationSec = 2.8 } = {}) {
+function chunkWordsByTime(words, { maxWords = 6, maxDurationSec = 2.8, maxChars = Infinity } = {}) {
   const chunks = [];
   let current = [];
   for (const word of words) {
     if (!word || typeof word.start !== "number" || typeof word.end !== "number") continue;
     const proposed = current.concat(word);
     const duration = (proposed[proposed.length - 1].end - proposed[0].start) / 1000;
-    if (current.length > 0 && (proposed.length > maxWords || duration > maxDurationSec)) {
+    const charCount = proposed.map((w) => String(w.text || "")).join(" ").length;
+    if (
+      current.length > 0 &&
+      (proposed.length > maxWords || duration > maxDurationSec || charCount > maxChars)
+    ) {
       chunks.push(current);
       current = [word];
     } else {
@@ -976,17 +1041,19 @@ function buildCaptionWordsFromSceneText(captions, durations) {
 
 /**
  * Build an ASS subtitle file with karaoke-style word-by-word highlighting.
- * Highlighted word = purple (#9B30FF), rest = white. Large bold centered.
+ * Highlighted word = bright purple (#B44FFF), rest = white. Large bold centered.
  */
 function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIGHT_BGR }) {
-  // Font scaling — captions are bold, centred, ~7% of the video height. This
-  // reads well on both 1080p landscape and 1920 portrait outputs.
-  const fontSize = Math.round(height * 0.07);
-  const marginV = Math.round(height * 0.12);
+  // Portrait vs landscape captions have very different constraints.
+  // Portrait 9:16 mobile videos need bigger type, tighter line-wrap, and a
+  // higher bottom margin so captions clear the phone nav bar.
+  const isPortrait = height > width;
+  const fontSize = isPortrait ? 52 : Math.round(height * 0.07);
+  const marginV = isPortrait ? 180 : Math.round(height * 0.12);
   // Outline + shadow scale with resolution so the dark stroke stays readable
   // over any background.
-  const outline = Math.max(3, Math.round(height * 0.004));
-  const shadow = Math.max(2, Math.round(height * 0.002));
+  const outline = isPortrait ? 4 : Math.max(3, Math.round(height * 0.004));
+  const shadow = isPortrait ? 2 : Math.max(2, Math.round(height * 0.002));
   // Use DejaVu Sans — it's installed in the container via `fonts-dejavu-core`
   // and libass/fontconfig will resolve it reliably. "Arial Black" is NOT
   // present on Debian, which caused libass to silently fall back to an
@@ -1013,9 +1080,11 @@ function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIG
   ];
 
   const events = [];
-  // Tighter chunks (max 5 words / 2.5s) keep captions readable and in sync
-  // with on-screen narration.
-  const chunks = chunkWordsByTime(words, { maxWords: 5, maxDurationSec: 2.5 });
+  // Portrait: aggressive wrap — cap at ~20 characters per chunk so no line
+  // exceeds screen width. Landscape: existing 5-word / 2.5s chunks.
+  const chunks = isPortrait
+    ? chunkWordsByTime(words, { maxWords: 4, maxDurationSec: 2.0, maxChars: 20 })
+    : chunkWordsByTime(words, { maxWords: 5, maxDurationSec: 2.5 });
   for (const chunk of chunks) {
     if (chunk.length === 0) continue;
     const chunkEnd = chunk[chunk.length - 1].end / 1000;
@@ -1028,7 +1097,7 @@ function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIG
         .map((cw, j) => {
           const t = escapeAssText(cw.text);
           if (j === i) {
-            // Active word: brand purple (#9B30FF) + slightly larger.
+            // Active word: brand bright purple (#B44FFF) + slightly larger.
             return `{\\c&H${highlightBgr}&\\fscx110\\fscy110}${t}{\\r}`;
           }
           return t;
@@ -1334,11 +1403,17 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
 
     onProgress({ stage: "extracting-audio", progress: 20, message: "Extracting audio for transcription…" });
     const audioPath = path.join(tmpDir, "source-audio.m4a");
-    await runFfmpeg(["-y", "-i", srcPath, "-vn", "-c:a", "aac", "-b:a", "128k", audioPath]);
+    let hasExtractedAudio = false;
+    try {
+      await runFfmpeg(["-y", "-i", srcPath, "-vn", "-c:a", "aac", "-b:a", "128k", audioPath]);
+      hasExtractedAudio = fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0;
+    } catch (e) {
+      console.warn("No usable audio track for AssemblyAI; falling back to scene text captions:", e.message);
+    }
 
     let words = [];
     let captionSource = "none";
-    if (ASSEMBLYAI_API_KEY) {
+    if (ASSEMBLYAI_API_KEY && hasExtractedAudio) {
       onProgress({ stage: "transcribing", progress: 35, message: "Transcribing with AssemblyAI…" });
       words = await transcribeWithAssemblyAi(audioPath);
       if (words.length > 0) captionSource = "assemblyai";
@@ -1365,7 +1440,7 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
     onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} visible captions (${captionSource})…` });
     const burnedPath = path.join(tmpDir, "captioned.mp4");
     // Branded karaoke captions must be produced by ASS/libass: active word
-    // purple (#9B30FF), inactive words white, bold centered, dark outline.
+    // bright purple (#B44FFF), inactive words white, bold centered, dark outline.
     // Do not silently fall back to plain drawtext or upload an uncaptioned MP4.
     const assPath = path.join(tmpDir, "captions.ass");
     fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H }), "utf8");
@@ -1479,6 +1554,8 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
   const isPortrait = target_aspect === "9:16";
   const W = isPortrait ? 1080 : 1920;
   const H = isPortrait ? 1920 : 1080;
+  const isShortPortrait = isShortPortraitPayload(body, clipUrls.length, target_aspect);
+  const fixedShortDuration = shortSceneDuration(body);
 
   try {
     // Download all video parts SEQUENTIALLY (one at a time). 40+ concurrent
@@ -1500,15 +1577,16 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     const narrationItems = normalizeNarrationItems(body);
     onProgress({ stage: "downloading-audio", progress: 32, message: `Downloading ${narrationItems.length} narration tracks…` });
     const narrationPaths = [];
+    const narrationDownloads = [];
     for (let i = 0; i < narrationItems.length; i++) {
       const ext = mediaExtFromUrl(narrationItems[i].url, "mp3");
       const dest = path.join(tmpDir, `narration-${String(i).padStart(3, "0")}.${ext}`);
       try {
         await downloadToFile(narrationItems[i].url, dest, `narration ${i + 1}`);
         narrationPaths.push(dest);
+        narrationDownloads.push({ ...narrationItems[i], path: dest });
       } catch (e) {
-        console.warn(`narration fetch FAILED for scene ${i + 1}`, narrationItems[i].url, e.message);
-        narrationPaths.push(null); // keep index aligned with clip index
+        console.warn("narration fetch", narrationItems[i].url, e.message);
       }
     }
 
@@ -1550,13 +1628,11 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       }
     }
 
-    // Build narration track from successfully downloaded files only (nulls filtered out)
-    const validNarrationPaths = narrationPaths.filter(Boolean);
     let narrationTrackPath = null;
-    if (validNarrationPaths.length > 1) {
+    if (narrationPaths.length > 1) {
       const narrationListPath = path.join(tmpDir, "narrations.ffconcat");
       narrationTrackPath = path.join(tmpDir, "narration-track.m4a");
-      fs.writeFileSync(narrationListPath, validNarrationPaths.map(ffconcatLine).join("\n") + "\n", "utf8");
+      fs.writeFileSync(narrationListPath, narrationPaths.map(ffconcatLine).join("\n") + "\n", "utf8");
       await runFfmpeg([
         "-y",
         "-f", "concat",
@@ -1569,27 +1645,24 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
         "-b:a", "192k",
         narrationTrackPath,
       ]);
-    } else if (validNarrationPaths.length === 1) {
-      narrationTrackPath = validNarrationPaths[0];
+    } else if (narrationPaths.length === 1) {
+      narrationTrackPath = narrationPaths[0];
     }
 
-    const narrationDurations = await Promise.all(
-      narrationPaths.map((p) => (p ? ffprobeDuration(p) : Promise.resolve(null)))
-    );
+    const narrationDurations = await Promise.all(narrationPaths.map((p) => ffprobeDuration(p)));
+    narrationDownloads.forEach((item, i) => { item.probed_duration = narrationDurations[i] || null; });
     const narrationDuration = narrationDurations.reduce((sum, d) => sum + (d || 0), 0);
 
-    const requestedClipDurations = normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
+    const requestedClipDurations = isShortPortrait
+      ? localPaths.map(() => fixedShortDuration)
+      : normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
     const requestedClipWeights = normalizeDurationList(body.clip_duration_weights || body.scene_duration_weights || body.duration_weights);
 
     // Per-scene image/narration sync: when we receive one narration per clip
     // (matching scene order), retime each clip to exactly its narration's
     // duration so images stay on screen as long as the voice over plays.
-    // FIX: validNarrationCount must equal localPaths.length — null placeholders
-    // (failed downloads) now keep the array index aligned but don't count as valid.
-    const validNarrationCount = narrationPaths.filter(Boolean).length;
     const perSceneSync =
       narrationPaths.length === localPaths.length &&
-      validNarrationCount === localPaths.length &&
       narrationPaths.length > 1 &&
       narrationDurations.every((d) => typeof d === "number" && d > 0);
     const explicitDurationSync =
@@ -1609,22 +1682,66 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       localPaths.length > 1;
     const weightedDurations = weightedDurationSync ? fitDurationsToTotal(requestedClipWeights, narrationDuration) : [];
     const stretchedDurations = stretchClipsToNarration ? fitDurationsToTotal(durations, narrationDuration) : [];
-
-    console.log(`[SYNC] clips=${localPaths.length} narrations=${narrationPaths.length} valid=${validNarrationCount} perSceneSync=${perSceneSync} narrationDuration=${narrationDuration.toFixed(2)}s`);
-
     const clipTargetDurations = localPaths.map((_, i) => {
-      if (perSceneSync) return narrationDurations[i] || durations[i] || 5;
+      if (perSceneSync) return narrationDurations[i];
       if (explicitDurationSync) return requestedClipDurations[i];
       if (weightedDurationSync) return weightedDurations[i] || durations[i] || 5;
       if (stretchClipsToNarration) return stretchedDurations[i] || durations[i] || 5;
       return durations[i] || 5;
     });
     const syncedTotalDuration = clipTargetDurations.reduce((s, d) => s + d, 0);
-    const baseTotalDuration = perSceneSync ? syncedTotalDuration : totalDuration;
+    const baseTotalDuration = syncedTotalDuration;
+
+    const clipSceneNumbers = Array.isArray(body.clip_scene_numbers)
+      ? body.clip_scene_numbers.map((n) => Number(n)).filter((n) => Number.isFinite(n))
+      : [];
+    const sceneNumberedNarrations = narrationDownloads.filter((n) => Number.isFinite(Number(n.scene_number)));
+    if (clipSceneNumbers.length === localPaths.length && sceneNumberedNarrations.length > 0) {
+      const byScene = new Map(sceneNumberedNarrations.map((n) => [Number(n.scene_number), n]));
+      const offsetsByScene = new Map();
+      const audioSegments = [];
+      onProgress({ stage: "syncing-audio", progress: 35, message: "Aligning narration to scene timings…" });
+      for (let i = 0; i < localPaths.length; i++) {
+        const target = Math.max(0.5, Number(clipTargetDurations[i]) || 0.5);
+        const segmentPath = path.join(tmpDir, `narration-segment-${String(i).padStart(4, "0")}.m4a`);
+        const sceneNumber = clipSceneNumbers[i];
+        const item = byScene.get(sceneNumber);
+        const offset = offsetsByScene.get(sceneNumber) || 0;
+        offsetsByScene.set(sceneNumber, offset + target);
+        const itemDuration = Number(item?.probed_duration) || 0;
+        if (item?.path && (!itemDuration || offset < itemDuration - 0.05)) {
+          await runFfmpeg([
+            "-y",
+            "-i", item.path,
+            "-filter_complex", `[0:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=${offset.toFixed(3)}:duration=${target.toFixed(3)},apad,atrim=duration=${target.toFixed(3)},asetpts=N/SR/TB[a]`,
+            "-map", "[a]",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            segmentPath,
+          ]);
+        } else {
+          await runFfmpeg([
+            "-y",
+            "-f", "lavfi",
+            "-i", `anullsrc=channel_layout=stereo:sample_rate=44100:d=${target.toFixed(3)}`,
+            "-c:a", "aac",
+            "-b:a", "192k",
+            segmentPath,
+          ]);
+        }
+        audioSegments.push(segmentPath);
+      }
+      const alignedListPath = path.join(tmpDir, "narrations-aligned.ffconcat");
+      narrationTrackPath = path.join(tmpDir, "narration-track-aligned.m4a");
+      fs.writeFileSync(alignedListPath, audioSegments.map(ffconcatLine).join("\n") + "\n", "utf8");
+      await runFfmpeg(["-y", "-f", "concat", "-safe", "0", "-i", alignedListPath, "-vn", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", narrationTrackPath]);
+    }
 
     const sfxDurations = await Promise.all(sfxPaths.map((s) => ffprobeDuration(s.path)));
     const maxSfxEnd = sfxPaths.reduce((max, s, i) => Math.max(max, s.timestamp + (sfxDurations[i] || 0)), 0);
-    const finalDuration = Math.max(1, baseTotalDuration, narrationDuration, maxSfxEnd);
+    const finalDuration = isShortPortrait
+      ? Math.max(1, baseTotalDuration, maxSfxEnd)
+      : Math.max(1, baseTotalDuration, narrationDuration, maxSfxEnd);
     const videoPadDuration = Math.max(0, finalDuration - baseTotalDuration);
 
     // Keep FFmpeg stable for long projects: normalize each clip in its own
@@ -1640,8 +1757,7 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       const pad = Math.max(0, target - srcDur);
       const normalizedPath = path.join(tmpDir, `normalized-${String(i).padStart(4, "0")}.mp4`);
       const vf =
-        `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
-        `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p,` +
+        `${fitClipToCanvasFilter(W, H, isPortrait)},` +
         `tpad=stop_mode=clone:stop_duration=${pad.toFixed(3)},` +
         `trim=duration=${target.toFixed(3)},setpts=PTS-STARTPTS`;
       await runFfmpeg([
@@ -1798,7 +1914,7 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     const captionsTag = captionedPath !== outPath ? `burned:${captionSource}` : captionSource;
     const meta = {
       clip_count: n,
-      narration_count: validNarrationCount,
+      narration_count: narrationPaths.length,
       sfx_count: sfxPaths.length,
       has_music: Boolean(musicPath),
       captions: captionsTag,
