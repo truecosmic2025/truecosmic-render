@@ -19,6 +19,7 @@ COPY server.js ./server.js
 ENV NODE_ENV=production
 ENV FFMPEG_PATH=/usr/local/bin/ffmpeg
 ENV CAPTIONS_FONT_FILE=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+ENV CAPTIONS_FONT_NAME="DejaVu Sans"
 ENV EMOJI_FONT_FILE=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf
 
 CMD ["node", "server.js"]
