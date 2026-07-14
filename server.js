@@ -1048,8 +1048,10 @@ function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIG
   // Portrait 9:16 mobile videos need bigger type, tighter line-wrap, and a
   // higher bottom margin so captions clear the phone nav bar.
   const isPortrait = height > width;
-  const fontSize = isPortrait ? 52 : Math.round(height * 0.07);
-  const marginV = isPortrait ? 180 : Math.round(height * 0.12);
+  // Shorts request: bigger type + higher position so captions clear the
+  // phone UI and are readable at arm's length.
+  const fontSize = isPortrait ? 64 : Math.round(height * 0.07);
+  const marginV = isPortrait ? 300 : Math.round(height * 0.12);
   // Outline + shadow scale with resolution so the dark stroke stays readable
   // over any background.
   const outline = isPortrait ? 4 : Math.max(3, Math.round(height * 0.004));
