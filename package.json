@@ -1,6 +1,6 @@
 {
   "name": "truecosmic-ken-burns-render",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "FFmpeg Ken Burns render server for TrueCosmic hybrid pipeline",
   "main": "server.js",
   "type": "commonjs",
