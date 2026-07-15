@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-07-14-portrait-shorts-render-lock-v26";
+const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-caption-recovery-v28";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1050,8 +1050,10 @@ function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIG
   const isPortrait = height > width;
   // Shorts request: bigger type + higher position so captions clear the
   // phone UI and are readable at arm's length.
-  const fontSize = isPortrait ? 64 : Math.round(height * 0.07);
-  const marginV = isPortrait ? 300 : Math.round(height * 0.12);
+  // Shorts: 76px type, ~25% from bottom (1920 * 0.25 = 480) so captions sit
+  // mid-lower third and clear phone chrome comfortably.
+  const fontSize = isPortrait ? 76 : Math.round(height * 0.07);
+  const marginV = isPortrait ? 480 : Math.round(height * 0.12);
   // Outline + shadow scale with resolution so the dark stroke stays readable
   // over any background.
   const outline = isPortrait ? 4 : Math.max(3, Math.round(height * 0.004));
