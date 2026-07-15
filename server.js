@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-duration-lock-v32";
+const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-duration-lock-v33";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -366,10 +366,12 @@ function shortSceneDuration(body, fallback = 2.5) {
 
 function shortPortraitDurationCap(body, clipCount, fixedSceneDuration) {
   const base = Math.max(1, clipCount) * fixedSceneDuration;
-  // Shorts are visual-beat timed: 2.5s per scene, with only a tiny allowance
-  // for the final closing word. Never let a stale/full narration stretch the
-  // whole render to 5–6 minutes.
-  return base + 4.0;
+  // Shorts are visual-beat timed with a per-scene minimum of ~2.5s, but a
+  // narration line can legitimately run 4-6s. Cap total at the worst case
+  // (every scene extended to the per-scene ceiling of 6s) plus a small tail,
+  // so a long narration never gets truncated mid-sentence but a runaway
+  // full-script audio still can't stretch the render to 5–6 minutes.
+  return Math.max(1, clipCount) * 6.0 + 4.0;
 }
 
 function fitClipToCanvasFilter(W, H, isPortrait) {
@@ -1665,21 +1667,24 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     narrationDownloads.forEach((item, i) => { item.probed_duration = narrationDurations[i] || null; });
     const narrationDuration = narrationDurations.reduce((sum, d) => sum + (d || 0), 0);
 
+    // Shorts default to a fixed short-scene duration (2.5s), but when a
+    // narration line is longer than that we MUST extend the clip so the
+    // spoken sentence isn't chopped mid-word. Cap per-scene at 6s so a stale
+    // full-script audio file can't balloon a single scene. The last clip
+    // gets a small extra tail so the closing word isn't clipped.
+    const perSceneMax = 6.0;
     const requestedClipDurations = isShortPortrait
-      ? localPaths.map(() => fixedShortDuration)
+      ? localPaths.map((_, i) => {
+          const narr = Number(narrationDurations[i]) || 0;
+          if (narr <= 0) return fixedShortDuration;
+          return Math.min(perSceneMax, Math.max(fixedShortDuration, narr + 0.25));
+        })
       : normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
-    // Shorts use a fixed 2.5s per scene, but the LAST scene's narration is
-    // often slightly longer than 2.5s — extend the final clip to fit the
-    // whole last narration (plus a small tail) so the closing word isn't
-    // clipped mid-syllable.
     if (isShortPortrait && narrationPaths.length === localPaths.length && narrationPaths.length > 0) {
       const lastIdx = requestedClipDurations.length - 1;
       const lastNarr = Number(narrationDurations[lastIdx]) || 0;
-      // Extend the last clip by at most 3s to catch a trailing word — never
-      // stretch to the full narration length (which could be a stale
-      // full-script audio file and would balloon the video by minutes).
-      const extension = Math.min(3, Math.max(0, lastNarr - fixedShortDuration)) + 0.6;
-      requestedClipDurations[lastIdx] = fixedShortDuration + extension;
+      const base = Math.max(fixedShortDuration, Math.min(perSceneMax, lastNarr + 0.25));
+      requestedClipDurations[lastIdx] = Math.min(perSceneMax + 1.0, base + 0.6);
     }
     const shortDurationCap = isShortPortrait
       ? shortPortraitDurationCap(body, localPaths.length, fixedShortDuration)
