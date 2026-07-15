@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-caption-recovery-v28";
+const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-duration-lock-v31";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -362,6 +362,14 @@ function shortSceneDuration(body, fallback = 2.5) {
   const value = Number(body?.short_scene_duration ?? body?.scene_duration_seconds ?? body?.clip_duration_seconds);
   if (Number.isFinite(value) && value > 0) return Math.max(0.5, Math.min(10, value));
   return fallback;
+}
+
+function shortPortraitDurationCap(body, clipCount, fixedSceneDuration) {
+  const base = Math.max(1, clipCount) * fixedSceneDuration;
+  // Shorts are visual-beat timed: 2.5s per scene, with only a tiny allowance
+  // for the final closing word. Never let a stale/full narration stretch the
+  // whole render to 5–6 minutes.
+  return base + 4.0;
 }
 
 function fitClipToCanvasFilter(W, H, isPortrait) {
@@ -1660,12 +1668,29 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     const requestedClipDurations = isShortPortrait
       ? localPaths.map(() => fixedShortDuration)
       : normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
+    // Shorts use a fixed 2.5s per scene, but the LAST scene's narration is
+    // often slightly longer than 2.5s — extend the final clip to fit the
+    // whole last narration (plus a small tail) so the closing word isn't
+    // clipped mid-syllable.
+    if (isShortPortrait && narrationPaths.length === localPaths.length && narrationPaths.length > 0) {
+      const lastIdx = requestedClipDurations.length - 1;
+      const lastNarr = Number(narrationDurations[lastIdx]) || 0;
+      // Extend the last clip by at most 3s to catch a trailing word — never
+      // stretch to the full narration length (which could be a stale
+      // full-script audio file and would balloon the video by minutes).
+      const extension = Math.min(3, Math.max(0, lastNarr - fixedShortDuration)) + 0.6;
+      requestedClipDurations[lastIdx] = fixedShortDuration + extension;
+    }
+    const shortDurationCap = isShortPortrait
+      ? shortPortraitDurationCap(body, localPaths.length, fixedShortDuration)
+      : Infinity;
     const requestedClipWeights = normalizeDurationList(body.clip_duration_weights || body.scene_duration_weights || body.duration_weights);
 
     // Per-scene image/narration sync: when we receive one narration per clip
     // (matching scene order), retime each clip to exactly its narration's
     // duration so images stay on screen as long as the voice over plays.
     const perSceneSync =
+      !isShortPortrait &&
       narrationPaths.length === localPaths.length &&
       narrationPaths.length > 1 &&
       narrationDurations.every((d) => typeof d === "number" && d > 0);
@@ -1693,6 +1718,22 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       if (stretchClipsToNarration) return stretchedDurations[i] || durations[i] || 5;
       return durations[i] || 5;
     });
+    if (isShortPortrait) {
+      let runningTotal = clipTargetDurations.reduce((s, d) => s + (Number(d) || 0), 0);
+      if (runningTotal > shortDurationCap) {
+        const overflow = runningTotal - shortDurationCap;
+        const lastIdx = clipTargetDurations.length - 1;
+        clipTargetDurations[lastIdx] = Math.max(fixedShortDuration, (Number(clipTargetDurations[lastIdx]) || fixedShortDuration) - overflow);
+        runningTotal = clipTargetDurations.reduce((s, d) => s + (Number(d) || 0), 0);
+      }
+      console.log("Shorts duration lock", {
+        clip_count: localPaths.length,
+        fixed_scene_duration: fixedShortDuration,
+        cap_seconds: shortDurationCap,
+        planned_seconds: runningTotal,
+        narration_seconds: narrationDuration,
+      });
+    }
     const syncedTotalDuration = clipTargetDurations.reduce((s, d) => s + d, 0);
     const baseTotalDuration = syncedTotalDuration;
 
@@ -1744,9 +1785,10 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     const sfxDurations = await Promise.all(sfxPaths.map((s) => ffprobeDuration(s.path)));
     const maxSfxEnd = sfxPaths.reduce((max, s, i) => Math.max(max, s.timestamp + (sfxDurations[i] || 0)), 0);
     const finalDuration = isShortPortrait
-      ? Math.max(1, baseTotalDuration, maxSfxEnd)
+      ? Math.min(shortDurationCap, Math.max(1, baseTotalDuration, Math.min(maxSfxEnd, shortDurationCap)))
       : Math.max(1, baseTotalDuration, narrationDuration, maxSfxEnd);
     const videoPadDuration = Math.max(0, finalDuration - baseTotalDuration);
+    const videoTrimRequired = isShortPortrait && baseTotalDuration > finalDuration + 0.05;
 
     // Keep FFmpeg stable for long projects: normalize each clip in its own
     // small process, concat the uniform MP4s with the demuxer, then run an
@@ -1800,8 +1842,8 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     ]);
 
     let videoForMixPath = concatVideoPath;
-    if (videoPadDuration > 0.05) {
-      videoForMixPath = path.join(tmpDir, "video-padded.mp4");
+    if (videoPadDuration > 0.05 || videoTrimRequired) {
+      videoForMixPath = path.join(tmpDir, videoTrimRequired ? "video-duration-locked.mp4" : "video-padded.mp4");
       await runFfmpeg([
         "-y",
         "-i", concatVideoPath,
