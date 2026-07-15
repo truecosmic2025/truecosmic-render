@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-duration-lock-v33";
+const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-narration-end-v34";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1667,24 +1667,25 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     narrationDownloads.forEach((item, i) => { item.probed_duration = narrationDurations[i] || null; });
     const narrationDuration = narrationDurations.reduce((sum, d) => sum + (d || 0), 0);
 
-    // Shorts default to a fixed short-scene duration (2.5s), but when a
-    // narration line is longer than that we MUST extend the clip so the
-    // spoken sentence isn't chopped mid-word. Cap per-scene at 6s so a stale
-    // full-script audio file can't balloon a single scene. The last clip
-    // gets a small extra tail so the closing word isn't clipped.
+    // Shorts are locked to the narration timeline, not to a guessed scene
+    // total. Each scene gets enough time for its own narration, and the final
+    // movie is hard-ended a few seconds after the complete narration finishes.
+    // This prevents the repeated regression where Shorts drift back into a
+    // 5+ minute render because visual beats are extended independently.
+    const SHORTS_NARRATION_TAIL_SECONDS = clampNumber(body.shorts_narration_tail_seconds, 2.5, 2.0, 3.0);
     const perSceneMax = 6.0;
     const requestedClipDurations = isShortPortrait
       ? localPaths.map((_, i) => {
           const narr = Number(narrationDurations[i]) || 0;
           if (narr <= 0) return fixedShortDuration;
-          return Math.min(perSceneMax, Math.max(fixedShortDuration, narr + 0.25));
+          return Math.min(perSceneMax, Math.max(0.8, narr + 0.08));
         })
       : normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
     if (isShortPortrait && narrationPaths.length === localPaths.length && narrationPaths.length > 0) {
       const lastIdx = requestedClipDurations.length - 1;
       const lastNarr = Number(narrationDurations[lastIdx]) || 0;
-      const base = Math.max(fixedShortDuration, Math.min(perSceneMax, lastNarr + 0.25));
-      requestedClipDurations[lastIdx] = Math.min(perSceneMax + 1.0, base + 0.6);
+      const base = Math.min(perSceneMax, Math.max(0.8, lastNarr + 0.08));
+      requestedClipDurations[lastIdx] = Math.min(perSceneMax + SHORTS_NARRATION_TAIL_SECONDS, base + SHORTS_NARRATION_TAIL_SECONDS);
     }
     const shortDurationCap = isShortPortrait
       ? shortPortraitDurationCap(body, localPaths.length, fixedShortDuration)
@@ -1731,12 +1732,13 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
         clipTargetDurations[lastIdx] = Math.max(fixedShortDuration, (Number(clipTargetDurations[lastIdx]) || fixedShortDuration) - overflow);
         runningTotal = clipTargetDurations.reduce((s, d) => s + (Number(d) || 0), 0);
       }
-      console.log("Shorts duration lock", {
+      console.log("Shorts narration-end lock", {
         clip_count: localPaths.length,
         fixed_scene_duration: fixedShortDuration,
         cap_seconds: shortDurationCap,
         planned_seconds: runningTotal,
         narration_seconds: narrationDuration,
+        tail_seconds: SHORTS_NARRATION_TAIL_SECONDS,
       });
     }
     const syncedTotalDuration = clipTargetDurations.reduce((s, d) => s + d, 0);
@@ -1789,8 +1791,11 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
 
     const sfxDurations = await Promise.all(sfxPaths.map((s) => ffprobeDuration(s.path)));
     const maxSfxEnd = sfxPaths.reduce((max, s, i) => Math.max(max, s.timestamp + (sfxDurations[i] || 0)), 0);
+    const shortsNarrationEndDuration = narrationDuration > 0
+      ? Math.min(shortDurationCap, narrationDuration + SHORTS_NARRATION_TAIL_SECONDS)
+      : Math.min(shortDurationCap, Math.max(1, baseTotalDuration, Math.min(maxSfxEnd, shortDurationCap)));
     const finalDuration = isShortPortrait
-      ? Math.min(shortDurationCap, Math.max(1, baseTotalDuration, Math.min(maxSfxEnd, shortDurationCap)))
+      ? shortsNarrationEndDuration
       : Math.max(1, baseTotalDuration, narrationDuration, maxSfxEnd);
     const videoPadDuration = Math.max(0, finalDuration - baseTotalDuration);
     const videoTrimRequired = isShortPortrait && baseTotalDuration > finalDuration + 0.05;
