@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-narration-end-v34";
+const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-narration-end-v35";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -366,12 +366,11 @@ function shortSceneDuration(body, fallback = 2.5) {
 
 function shortPortraitDurationCap(body, clipCount, fixedSceneDuration) {
   const base = Math.max(1, clipCount) * fixedSceneDuration;
-  // Shorts are visual-beat timed with a per-scene minimum of ~2.5s, but a
-  // narration line can legitimately run 4-6s. Cap total at the worst case
-  // (every scene extended to the per-scene ceiling of 6s) plus a small tail,
+  // Shorts are narration-ended. Cap only as a runaway safety rail; the real
+  // final duration is computed from the last audible narration point plus a tail,
   // so a long narration never gets truncated mid-sentence but a runaway
   // full-script audio still can't stretch the render to 5–6 minutes.
-  return Math.max(1, clipCount) * 6.0 + 4.0;
+  return Math.max(1, clipCount) * 10.0 + 4.0;
 }
 
 function fitClipToCanvasFilter(W, H, isPortrait) {
@@ -1789,10 +1788,14 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       await runFfmpeg(["-y", "-f", "concat", "-safe", "0", "-i", alignedListPath, "-vn", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", narrationTrackPath]);
     }
 
+    const narrationTrackDuration = narrationTrackPath ? (await ffprobeDuration(narrationTrackPath)) : 0;
+    const audibleNarrationDuration = narrationTrackDuration > 0
+      ? narrationTrackDuration
+      : narrationDuration;
     const sfxDurations = await Promise.all(sfxPaths.map((s) => ffprobeDuration(s.path)));
     const maxSfxEnd = sfxPaths.reduce((max, s, i) => Math.max(max, s.timestamp + (sfxDurations[i] || 0)), 0);
-    const shortsNarrationEndDuration = narrationDuration > 0
-      ? Math.min(shortDurationCap, narrationDuration + SHORTS_NARRATION_TAIL_SECONDS)
+    const shortsNarrationEndDuration = audibleNarrationDuration > 0
+      ? Math.min(shortDurationCap, audibleNarrationDuration + SHORTS_NARRATION_TAIL_SECONDS)
       : Math.min(shortDurationCap, Math.max(1, baseTotalDuration, Math.min(maxSfxEnd, shortDurationCap)));
     const finalDuration = isShortPortrait
       ? shortsNarrationEndDuration
