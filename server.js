@@ -1673,16 +1673,33 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     // 5+ minute render because visual beats are extended independently.
     const SHORTS_NARRATION_TAIL_SECONDS = clampNumber(body.shorts_narration_tail_seconds, 2.5, 2.0, 3.0);
     const perSceneMax = 6.0;
+     // Match image timing to its OWN scene by scene number — same reliable
+    // method the audio track already uses. Position-based matching silently
+    // breaks (and every clip after it drifts) if a narration download fails.
+    const clipSceneNumbersForTiming = Array.isArray(body.clip_scene_numbers)
+      ? body.clip_scene_numbers.map((n) => Number(n)).filter((n) => Number.isFinite(n))
+      : [];
+    const narrationDurationByScene = new Map();
+    narrationDownloads.forEach((item, i) => {
+      const sn = Number(item.scene_number);
+      if (Number.isFinite(sn)) narrationDurationByScene.set(sn, Number(narrationDurations[i]) || 0);
+    });
+    const narrForClip = (i) => {
+      const sn = clipSceneNumbersForTiming[i];
+      if (Number.isFinite(sn) && narrationDurationByScene.has(sn)) return narrationDurationByScene.get(sn);
+      return Number(narrationDurations[i]) || 0;
+    };
+
     const requestedClipDurations = isShortPortrait
       ? localPaths.map((_, i) => {
-          const narr = Number(narrationDurations[i]) || 0;
+          const narr = narrForClip(i);
           if (narr <= 0) return fixedShortDuration;
           return Math.min(perSceneMax, Math.max(0.8, narr + 0.08));
         })
       : normalizeDurationList(body.clip_durations || body.scene_durations || body.durations);
     if (isShortPortrait && narrationPaths.length === localPaths.length && narrationPaths.length > 0) {
       const lastIdx = requestedClipDurations.length - 1;
-      const lastNarr = Number(narrationDurations[lastIdx]) || 0;
+      const lastNarr = narrForClip(lastIdx);
       const base = Math.min(perSceneMax, Math.max(0.8, lastNarr + 0.08));
       requestedClipDurations[lastIdx] = Math.min(perSceneMax + SHORTS_NARRATION_TAIL_SECONDS, base + SHORTS_NARRATION_TAIL_SECONDS);
     }
