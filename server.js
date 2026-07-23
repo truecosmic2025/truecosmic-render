@@ -1006,19 +1006,50 @@ function chunkWords(words, maxWords = 7) {
 function chunkWordsByTime(words, { maxWords = 6, maxDurationSec = 2.8, maxChars = Infinity } = {}) {
   const chunks = [];
   let current = [];
-  for (const word of words) {
+  const endsSentence = (w) => /[.!?][)"'”’]?$/.test(String(w?.text || "").trim());
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
     if (!word || typeof word.start !== "number" || typeof word.end !== "number") continue;
     const proposed = current.concat(word);
     const duration = (proposed[proposed.length - 1].end - proposed[0].start) / 1000;
     const charCount = proposed.map((w) => String(w.text || "")).join(" ").length;
-    if (
+    const hitHardLimit =
       current.length > 0 &&
-      (proposed.length > maxWords || duration > maxDurationSec || charCount > maxChars)
+      (proposed.length > maxWords || duration > maxDurationSec || charCount > maxChars);
+    if (
+      current.length >= 2 &&
+      endsSentence(current[current.length - 1]) &&
+      (hitHardLimit ||
+        proposed.length >= maxWords ||
+        duration >= maxDurationSec * 0.85 ||
+        charCount >= maxChars * 0.85)
     ) {
       chunks.push(current);
       current = [word];
-    } else {
-      current = proposed;
+      continue;
+    }
+    if (hitHardLimit) {
+      let cutIdx = -1;
+      for (let k = current.length - 1; k >= Math.max(0, current.length - 2); k--) {
+        if (endsSentence(current[k])) { cutIdx = k; break; }
+      }
+      if (cutIdx >= 0 && cutIdx < current.length - 1) {
+        chunks.push(current.slice(0, cutIdx + 1));
+        current = current.slice(cutIdx + 1).concat(word);
+      } else {
+        chunks.push(current);
+        current = [word];
+      }
+      continue;
+    }
+    current = proposed;
+    if (
+      current.length >= 2 &&
+      endsSentence(word) &&
+      (current.length >= 3 || duration >= maxDurationSec * 0.5)
+    ) {
+      chunks.push(current);
+      current = [];
     }
   }
   if (current.length > 0) chunks.push(current);
