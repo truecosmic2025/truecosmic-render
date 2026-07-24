@@ -1092,8 +1092,8 @@ function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIG
   // phone UI and are readable at arm's length.
   // Shorts: 76px type, ~25% from bottom (1920 * 0.25 = 480) so captions sit
   // mid-lower third and clear phone chrome comfortably.
-  const fontSize = isPortrait ? 76 : Math.round(height * 0.07);
-  const marginV = isPortrait ? 480 : Math.round(height * 0.12);
+  const fontSize = isPortrait ? 86 : Math.round(height * 0.07);
+  const marginV = isPortrait ? 680 : Math.round(height * 0.12);
   // Outline + shadow scale with resolution so the dark stroke stays readable
   // over any background.
   const outline = isPortrait ? 4 : Math.max(3, Math.round(height * 0.004));
@@ -1703,7 +1703,7 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     // This prevents the repeated regression where Shorts drift back into a
     // 5+ minute render because visual beats are extended independently.
     const SHORTS_NARRATION_TAIL_SECONDS = clampNumber(body.shorts_narration_tail_seconds, 2.5, 2.0, 3.0);
-    const perSceneMax = 6.0;
+    const perSceneMax = Infinity;
      // Match image timing to its OWN scene by scene number — same reliable
     // method the audio track already uses. Position-based matching silently
     // breaks (and every clip after it drifts) if a narration download fails.
