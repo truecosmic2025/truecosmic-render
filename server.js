@@ -1207,7 +1207,7 @@ async function transcribeWithAssemblyAi(audioPath) {
     }
     throw new Error("AssemblyAI transcript timed out");
   } catch (e) {
-    console.warn("AssemblyAI captioning failed:", e.message);
+    console.warn("AssemblyAI captioning failed:", e.message, e.cause ? `| cause: ${JSON.stringify(e.cause)}` : "| no cause captured");
     return [];
   }
 }
