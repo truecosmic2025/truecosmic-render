@@ -365,12 +365,18 @@ function shortSceneDuration(body, fallback = 2.5) {
 }
 
 function shortPortraitDurationCap(body, clipCount, fixedSceneDuration) {
-  const base = Math.max(1, clipCount) * fixedSceneDuration;
-  // Shorts are narration-ended. Cap only as a runaway safety rail; the real
-  // final duration is computed from the last audible narration point plus a tail,
-  // so a long narration never gets truncated mid-sentence but a runaway
-  // full-script audio still can't stretch the render to 5–6 minutes.
-  return Math.max(1, clipCount) * 10.0 + 4.0;
+  // Hard YouTube Shorts ceiling. This MUST NOT scale with clip count — a
+  // per-clip allowance (previously clipCount * 10 + 4) let videos with
+  // 18+ scenes sail past 180s and get rejected by YouTube/Metricool. The
+  // final render is always hard-trimmed to whatever this returns (see
+  // `finalDuration` / `videoTrimRequired` below), so this is the single
+  // source of truth for the maximum Shorts length.
+  const HARD_CAP_SECONDS = 178; // stay a couple seconds under YouTube's 180s Shorts limit
+  const requested = Number(body?.max_duration_seconds ?? body?.target_duration_seconds);
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.min(HARD_CAP_SECONDS, requested);
+  }
+  return HARD_CAP_SECONDS;
 }
 
 function fitClipToCanvasFilter(W, H, isPortrait) {
