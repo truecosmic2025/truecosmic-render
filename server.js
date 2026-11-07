@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-07-15-portrait-shorts-narration-end-v35";
+const RENDER_SERVER_VERSION = "2026-11-07-long-portrait-no-brand-wrap";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -354,6 +354,10 @@ function normalizeDurationList(input) {
 
 function isShortPortraitPayload(body, clipCount, targetAspect) {
   const explicitShort = body?.shorts_mode === true || body?.is_shorts === true || body?.force_short_form === true;
+  // The app sends shorts_mode:false only for long-form projects (portrait
+  // with a target over 180s). Honour it instead of guessing from clip count,
+  // otherwise a long portrait story is cut at the 178s Shorts cap.
+  if (body?.shorts_mode === false && targetAspect === "9:16") return false;
   const requestedTarget = Number(body?.target_duration_seconds ?? body?.target_duration ?? 0);
   return targetAspect === "9:16" && (explicitShort || requestedTarget <= 180 || clipCount >= 30);
 }
@@ -1504,7 +1508,11 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
     // WxH / 25fps / yuv420p / stereo AAC profile, then concat-demuxed with
     // the captioned body so audio (intro music, outro music) stays intact.
     let finalPath = burnedPath;
-    const introOutroUrls = [
+    // Brand intro/outro assets are landscape YouTube bumpers; in a 9:16 phone
+    // video they show as letterboxed strips, so portrait renders skip them
+    // unless a caller explicitly opts in.
+    const skipPortraitBrandWrap = isPortrait && body.allow_portrait_brand_wrap !== true;
+    const introOutroUrls = skipPortraitBrandWrap ? [] : [
       { kind: "intro", url: body.intro_url },
       { kind: "outro", url: body.outro_url },
     ].filter((x) => typeof x.url === "string" && x.url.length > 0);
@@ -1552,8 +1560,8 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
         bodyNormPath,
       ]);
       const parts = [];
-      const introUrl = body.intro_url;
-      const outroUrl = body.outro_url;
+      const introUrl = skipPortraitBrandWrap ? null : body.intro_url;
+      const outroUrl = skipPortraitBrandWrap ? null : body.outro_url;
       if (introUrl) parts.push(await normalizeBrandClip(introUrl, "intro"));
       parts.push(bodyNormPath);
       if (outroUrl) parts.push(await normalizeBrandClip(outroUrl, "outro"));
