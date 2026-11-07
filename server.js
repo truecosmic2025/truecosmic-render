@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-11-07-long-portrait-no-brand-wrap";
+const RENDER_SERVER_VERSION = "2026-11-07-long-portrait-end-tail";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1801,6 +1801,14 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
         narration_seconds: narrationDuration,
         tail_seconds: SHORTS_NARRATION_TAIL_SECONDS,
       });
+    }
+    // Long-form portrait (explicit shorts_mode:false): per-scene sync times the
+    // last scene to exactly its narration, so the final word lands on the last
+    // frame and gets clipped. Hold the last scene for a short tail instead.
+    if (!isShortPortrait && target_aspect === "9:16" && body.shorts_mode === false && clipTargetDurations.length > 0) {
+      const endTail = clampNumber(body.end_tail_seconds, 2.5, 0, 6);
+      const lastIdx = clipTargetDurations.length - 1;
+      clipTargetDurations[lastIdx] = (Number(clipTargetDurations[lastIdx]) || 0) + endTail;
     }
     const syncedTotalDuration = clipTargetDurations.reduce((s, d) => s + d, 0);
     const baseTotalDuration = syncedTotalDuration;
