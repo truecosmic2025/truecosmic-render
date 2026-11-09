@@ -1167,6 +1167,27 @@ function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIG
 }
 
 /**
+ * Optional per-request caption spelling fixes, e.g.
+ * caption_replacements: [{ from: "Andrei", to: "Andre" }, { from: "24.99", to: "$24.99" }].
+ * Matches whole words (case-insensitive, ignoring surrounding punctuation) and
+ * keeps that punctuation. No field = words returned unchanged.
+ */
+function applyCaptionReplacements(words, body) {
+  const list = Array.isArray(body?.caption_replacements) ? body.caption_replacements : [];
+  const rules = list
+    .filter((r) => r && typeof r.from === "string" && typeof r.to === "string" && r.from.trim())
+    .map((r) => ({ from: r.from.trim().toLowerCase(), to: r.to }));
+  if (!rules.length || !Array.isArray(words)) return words;
+  return words.map((w) => {
+    const text = String(w?.text ?? "");
+    const m = text.match(/^([("“‘'\[]*)(.*?)([)"”’'\].,!?;:…]*)$/);
+    if (!m) return w;
+    const rule = rules.find((r) => r.from === m[2].toLowerCase());
+    return rule ? { ...w, text: m[1] + rule.to + m[3] } : w;
+  });
+}
+
+/**
  * Upload audio to AssemblyAI and request a transcript with word timestamps.
  * Returns the words array (each: { text, start, end }) or [] on failure.
  */
@@ -1469,7 +1490,7 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
     let captionSource = "none";
     if (ASSEMBLYAI_API_KEY && hasExtractedAudio) {
       onProgress({ stage: "transcribing", progress: 35, message: "Transcribing with AssemblyAI…" });
-      words = await transcribeWithAssemblyAi(audioPath);
+      words = applyCaptionReplacements(await transcribeWithAssemblyAi(audioPath), body);
       if (words.length > 0) captionSource = "assemblyai";
     } else {
       console.warn("ASSEMBLYAI_API_KEY not set on render server; will rely on fallback caption text only.");
@@ -2007,7 +2028,7 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       if (ASSEMBLYAI_API_KEY && hasAudio) {
         const audioOnly = path.join(tmpDir, "final-audio.m4a");
         await runFfmpeg(["-y", "-i", outPath, "-vn", "-c:a", "aac", "-b:a", "128k", audioOnly]);
-        words = await transcribeWithAssemblyAi(audioOnly);
+        words = applyCaptionReplacements(await transcribeWithAssemblyAi(audioOnly), body);
         if (words.length > 0) captionSource = "assemblyai";
       }
 
