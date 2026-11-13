@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-11-07-long-portrait-end-tail";
+const RENDER_SERVER_VERSION = "2026-11-13-avatar-ad-compose";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1427,6 +1427,150 @@ app.post("/stitch-final", async (req, res) => {
 //   captions:     fallback caption items (used only if AssemblyAI yields nothing)
 //   scenes, clip_duration_weights: same fallback shape as /stitch-final
 // }
+// ==========================================================================
+// POST /avatar-ad-compose  (opt-in; nothing else calls it)
+// Coaching ad layout: intro = still frame of the presenter video + a cut-out
+// "pointer" person (green-backed clip, keyed out) bottom-left + white headline
+// box + "Listen. Carefully…" line, using the pointer clip's own audio; then the
+// presenter video. Word-by-word karaoke captions (AssemblyAI) are burned across
+// the whole ad. Body:
+//   main_url (presenter mp4), pointer_url (green-backed cut-out mp4),
+//   pointer_audio_url? (original clip, used for audio if given), headline,
+//   subline? ("Listen. Carefully…"), upload_url (signed PUT), public_url?,
+//   highlight_bgr? (ASS BBGGRR, default 00FFFF = yellow), intro_max_sec? (15)
+// ==========================================================================
+function hasAudioStream(filePath) {
+  return new Promise((resolve) => {
+    const proc = spawn(FFPROBE_BIN, ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", filePath],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    proc.stdout.on("data", (d) => { out += d.toString(); });
+    proc.on("error", () => resolve(false));
+    proc.on("close", () => resolve(out.trim().length > 0));
+  });
+}
+
+function buildAdIntroAss({ width, height, headline, subline, durationSec }) {
+  const font = process.env.CAPTIONS_FONT_NAME || "DejaVu Sans";
+  const end = formatAssTime(durationSec);
+  // Headline: black bold italic on an opaque white box (BorderStyle 3 = box in OutlineColour).
+  // "‼" / "!!" at the end is coloured red like the CapCut originals.
+  const esc = (t) => escapeAssText(String(t || "").trim());
+  let head = esc(headline).toUpperCase();
+  head = head.replace(/(‼|!!)\s*$/, "{\\c&H0000E0&}‼{\\c&H000000&}");
+  const lines = [
+    "[Script Info]", "ScriptType: v4.00+", "WrapStyle: 0", "ScaledBorderAndShadow: yes",
+    `PlayResX: ${width}`, `PlayResY: ${height}`, "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    `Style: Head,${font},58,&H00000000,&H00000000,&H00FFFFFF,&H00FFFFFF,1,1,0,0,100,100,0,0,3,16,0,5,90,90,0,1`,
+    `Style: Sub,${font},52,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,4,2,5,60,60,0,1`,
+    "", "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    `Dialogue: 1,0:00:00.00,${end},Head,,0,0,0,,{\\pos(${Math.round(width / 2)},${Math.round(height * 0.47)})}${head}`,
+  ];
+  if (subline) lines.push(`Dialogue: 1,0:00:00.00,${end},Sub,,0,0,0,,{\\pos(${Math.round(width / 2)},${Math.round(height * 0.555)})}${esc(subline)}`);
+  return lines.join("\n") + "\n";
+}
+
+function escapeFilterPath(p) {
+  return p.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'").replace(/,/g, "\\,");
+}
+
+async function runAvatarAdCompose(body, { onProgress }) {
+  const W = 1080, H = 1920, FPS = 30;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "avatar-ad-"));
+  try {
+    onProgress({ status: "running", stage: "downloading", progress: 5, message: "Downloading presenter and pointer clips…" });
+    const mainPath = path.join(tmpDir, "main.mp4");
+    const ptrPath = path.join(tmpDir, "pointer.mp4");
+    await downloadToFile(body.main_url, mainPath, "presenter video");
+    await downloadToFile(body.pointer_url, ptrPath, "pointer clip");
+    let ptrAudioPath = ptrPath;
+    if (body.pointer_audio_url) {
+      ptrAudioPath = path.join(tmpDir, "pointer-orig.mp4");
+      await downloadToFile(body.pointer_audio_url, ptrAudioPath, "pointer audio");
+    }
+    const ptrDur = (await ffprobeDuration(ptrPath)) || 8;
+    const introDur = Math.max(2, Math.min(clampNumber(body.intro_max_sec, 15, 2, 30), ptrDur));
+
+    onProgress({ stage: "intro", progress: 20, message: "Building the intro…" });
+    const stillPath = path.join(tmpDir, "still.png");
+    await extractFramePng(mainPath, stillPath, 0.6);
+    const introAss = path.join(tmpDir, "intro.ass");
+    fs.writeFileSync(introAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "Listen. Carefully…", durationSec: introDur }), "utf8");
+    const ptrH = Math.round(H * clampNumber(body.pointer_height_ratio, 0.56, 0.3, 0.8));
+    const introAudio = await hasAudioStream(ptrAudioPath);
+    const introPath = path.join(tmpDir, "intro.mp4");
+    const introArgs = ["-y", "-loop", "1", "-t", String(introDur), "-i", stillPath, "-i", ptrPath];
+    if (introAudio) introArgs.push("-i", ptrAudioPath);
+    else introArgs.push("-f", "lavfi", "-t", String(introDur), "-i", "anullsrc=r=44100:cl=stereo");
+    introArgs.push(
+      "-filter_complex",
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${FPS}[bg];` +
+      `[1:v]fps=${FPS},scale=-2:${ptrH},colorkey=0x00FF00:0.32:0.08,despill=type=green[p];` +
+      `[bg][p]overlay=x=-30:y=H-h:eof_action=pass,ass='${escapeFilterPath(introAss)}',format=yuv420p[v];` +
+      `[2:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,apad[a]`,
+      "-map", "[v]", "-map", "[a]", "-t", String(introDur),
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-r", String(FPS), "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", introPath);
+    await runFfmpeg(introArgs);
+
+    onProgress({ stage: "joining", progress: 40, message: "Joining intro and presenter video…" });
+    const joinedPath = path.join(tmpDir, "joined.mp4");
+    await runFfmpeg(["-y", "-i", introPath, "-i", mainPath, "-filter_complex",
+      `[1:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${FPS},format=yuv420p[mv];` +
+      `[1:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo[ma];` +
+      `[0:v][0:a][mv][ma]concat=n=2:v=1:a=1[v][a]`,
+      "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", joinedPath]);
+
+    onProgress({ stage: "transcribing", progress: 55, message: "Transcribing for captions…" });
+    const audioPath = path.join(tmpDir, "joined-audio.m4a");
+    await runFfmpeg(["-y", "-i", joinedPath, "-vn", "-c:a", "aac", "-b:a", "128k", audioPath]);
+    let words = ASSEMBLYAI_API_KEY ? await transcribeWithAssemblyAi(audioPath) : [];
+    if (words.length === 0 && typeof body.caption_text === "string" && body.caption_text.trim()) {
+      // Fallback: spread the presenter script evenly over the presenter part (after the intro).
+      const total = (await ffprobeDuration(joinedPath)) || introDur + 30;
+      words = buildCaptionWordsFromSceneText([{ text: body.caption_text }], [Math.max(1, total - introDur)])
+        .map((w) => ({ ...w, start: w.start + introDur * 1000, end: w.end + introDur * 1000 }));
+    }
+    if (words.length === 0) throw new Error("No caption words (AssemblyAI returned nothing and no caption_text given)");
+
+    onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} caption words…` });
+    const assPath = path.join(tmpDir, "captions.ass");
+    fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H, highlightBgr: /^[0-9A-Fa-f]{6}$/.test(body.highlight_bgr || "") ? body.highlight_bgr : "00FFFF" }), "utf8");
+    const finalPath = path.join(tmpDir, "final.mp4");
+    await burnCaptionsIntoVideo(joinedPath, finalPath, assPath, words, tmpDir);
+
+    onProgress({ stage: "uploading", progress: 92, message: "Uploading finished ad…" });
+    const putRes = await fetch(body.upload_url, { method: "PUT", headers: { "Content-Type": "video/mp4", "x-upsert": "true" }, body: fs.readFileSync(finalPath) });
+    if (!putRes.ok) throw new Error(`Signed upload failed (${putRes.status}): ${(await putRes.text().catch(() => "")).slice(0, 200)}`);
+    const duration = await ffprobeDuration(finalPath);
+    return { video_url: body.public_url || null, intro_seconds: introDur, duration, word_count: words.length };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+app.post("/avatar-ad-compose", (req, res) => {
+  const body = req.body || {};
+  for (const k of ["main_url", "pointer_url", "upload_url", "headline"]) {
+    if (!body[k] || typeof body[k] !== "string") return res.status(400).json({ error: `${k} is required` });
+  }
+  const job = createJob();
+  updateJob(job.id, { clip_count: 1, message: "Ad compose queued" });
+  res.status(202).json({ ok: true, async: true, job_id: job.id, status_url: `/status/${job.id}` });
+  setImmediate(() => {
+    runAvatarAdCompose(body, { onProgress: (patch) => updateJob(job.id, patch) })
+      .then((r) => updateJob(job.id, { status: "complete", stage: "complete", progress: 100, message: "Ad composed", ...r, completed_at: Date.now() }))
+      .catch((e) => {
+        console.error("avatar-ad-compose failed", e);
+        updateJob(job.id, { status: "failed", stage: "failed", error: e?.message || "compose failed", message: e?.message || "compose failed", completed_at: Date.now() });
+      });
+  });
+});
+
 // ==========================================================================
 app.post("/burn-captions-only", async (req, res) => {
   const body = req.body || {};
