@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-11-13-avatar-ad-compose";
+const RENDER_SERVER_VERSION = "2026-11-14-avatar-ad-headline-full";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1517,9 +1517,18 @@ async function runAvatarAdCompose(body, { onProgress }) {
     await runFfmpeg(introArgs);
 
     onProgress({ stage: "joining", progress: 40, message: "Joining intro and presenter video…" });
+    // The headline + line under it stay on screen for the whole ad (same place as in the intro),
+    // unless headline_full_video is false.
+    let mainHeadFilter = "";
+    if (body.headline_full_video !== false) {
+      const mainDur = (await ffprobeDuration(mainPath)) || 600;
+      const mainHeadAss = path.join(tmpDir, "main-head.ass");
+      fs.writeFileSync(mainHeadAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "Listen. Carefully…", durationSec: mainDur + 1 }), "utf8");
+      mainHeadFilter = `,ass='${escapeFilterPath(mainHeadAss)}'`;
+    }
     const joinedPath = path.join(tmpDir, "joined.mp4");
     await runFfmpeg(["-y", "-i", introPath, "-i", mainPath, "-filter_complex",
-      `[1:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${FPS},format=yuv420p[mv];` +
+      `[1:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${FPS}${mainHeadFilter},format=yuv420p[mv];` +
       `[1:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo[ma];` +
       `[0:v][0:a][mv][ma]concat=n=2:v=1:a=1[v][a]`,
       "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
