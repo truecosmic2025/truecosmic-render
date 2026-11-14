@@ -31,7 +31,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-11-14-ad-compose-no-pointer";
+const RENDER_SERVER_VERSION = "2026-11-14-ad-text-position";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1093,7 +1093,7 @@ function buildCaptionWordsFromSceneText(captions, durations) {
  * Build an ASS subtitle file with karaoke-style word-by-word highlighting.
  * Highlighted word = bright purple (#B44FFF), rest = white. Large bold centered.
  */
-function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIGHT_BGR }) {
+function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIGHT_BGR, marginVOverride = null }) {
   // Portrait vs landscape captions have very different constraints.
   // Portrait 9:16 mobile videos need bigger type, tighter line-wrap, and a
   // higher bottom margin so captions clear the phone nav bar.
@@ -1103,7 +1103,7 @@ function buildKaraokeAss(words, { width, height, highlightBgr = CAPTIONS_HIGHLIG
   // Shorts: 76px type, ~25% from bottom (1920 * 0.25 = 480) so captions sit
   // mid-lower third and clear phone chrome comfortably.
   const fontSize = isPortrait ? 86 : Math.round(height * 0.07);
-  const marginV = isPortrait ? 680 : Math.round(height * 0.12);
+  const marginV = Number.isFinite(marginVOverride) ? marginVOverride : isPortrait ? 680 : Math.round(height * 0.12);
   // Outline + shadow scale with resolution so the dark stroke stays readable
   // over any background.
   const outline = isPortrait ? 4 : Math.max(3, Math.round(height * 0.004));
@@ -1450,7 +1450,7 @@ function hasAudioStream(filePath) {
   });
 }
 
-function buildAdIntroAss({ width, height, headline, subline, durationSec }) {
+function buildAdIntroAss({ width, height, headline, subline, durationSec, headY = 0.47 }) {
   const font = process.env.CAPTIONS_FONT_NAME || "DejaVu Sans";
   const end = formatAssTime(durationSec);
   // Headline: black bold italic on an opaque white box (BorderStyle 3 = box in OutlineColour).
@@ -1467,9 +1467,9 @@ function buildAdIntroAss({ width, height, headline, subline, durationSec }) {
     `Style: Sub,${font},52,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,4,2,5,60,60,0,1`,
     "", "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    `Dialogue: 1,0:00:00.00,${end},Head,,0,0,0,,{\\pos(${Math.round(width / 2)},${Math.round(height * 0.47)})}${head}`,
+    `Dialogue: 1,0:00:00.00,${end},Head,,0,0,0,,{\\pos(${Math.round(width / 2)},${Math.round(height * headY)})}${head}`,
   ];
-  if (subline) lines.push(`Dialogue: 1,0:00:00.00,${end},Sub,,0,0,0,,{\\pos(${Math.round(width / 2)},${Math.round(height * 0.555)})}${esc(subline)}`);
+  if (subline) lines.push(`Dialogue: 1,0:00:00.00,${end},Sub,,0,0,0,,{\\pos(${Math.round(width / 2)},${Math.round(height * (headY + 0.085))})}${esc(subline)}`);
   return lines.join("\n") + "\n";
 }
 
@@ -1500,7 +1500,7 @@ async function runAvatarAdCompose(body, { onProgress }) {
     const stillPath = path.join(tmpDir, "still.png");
     await extractFramePng(mainPath, stillPath, 0.6);
     const introAss = path.join(tmpDir, "intro.ass");
-    fs.writeFileSync(introAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "Listen. Carefully…", durationSec: introDur }), "utf8");
+    fs.writeFileSync(introAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "Listen. Carefully…", durationSec: introDur, headY: adTextLayout(body, H).headY }), "utf8");
     const ptrH = Math.round(H * clampNumber(body.pointer_height_ratio, 0.56, 0.3, 0.8));
     const introAudio = await hasAudioStream(ptrAudioPath);
     const introPath = path.join(tmpDir, "intro.mp4");
@@ -1525,7 +1525,7 @@ async function runAvatarAdCompose(body, { onProgress }) {
     if (body.headline_full_video !== false) {
       const mainDur = (await ffprobeDuration(mainPath)) || 600;
       const mainHeadAss = path.join(tmpDir, "main-head.ass");
-      fs.writeFileSync(mainHeadAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "Listen. Carefully…", durationSec: mainDur + 1 }), "utf8");
+      fs.writeFileSync(mainHeadAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "Listen. Carefully…", durationSec: mainDur + 1, headY: adTextLayout(body, H).headY }), "utf8");
       mainHeadFilter = `,ass='${escapeFilterPath(mainHeadAss)}'`;
     }
     const joinedPath = path.join(tmpDir, "joined.mp4");
@@ -1550,7 +1550,7 @@ async function runAvatarAdCompose(body, { onProgress }) {
 
     onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} caption words…` });
     const assPath = path.join(tmpDir, "captions.ass");
-    fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H, highlightBgr: /^[0-9A-Fa-f]{6}$/.test(body.highlight_bgr || "") ? body.highlight_bgr : "00FFFF" }), "utf8");
+    fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H, highlightBgr: /^[0-9A-Fa-f]{6}$/.test(body.highlight_bgr || "") ? body.highlight_bgr : "00FFFF", marginVOverride: adTextLayout(body, H).captionMarginV }), "utf8");
     const finalPath = path.join(tmpDir, "final.mp4");
     await burnCaptionsIntoVideo(joinedPath, finalPath, assPath, words, tmpDir);
 
@@ -1564,12 +1564,20 @@ async function runAvatarAdCompose(body, { onProgress }) {
   }
 }
 
+// Text position for ad overlays. "lower" moves headline, line under it and captions down so a face in
+// the upper half stays clear (captions stay above the bottom ~20% that Reels/Stories UI covers).
+function adTextLayout(body, height) {
+  if (body.text_position === "lower") return { headY: 0.62, captionMarginV: Math.round(height * 0.2) };
+  return { headY: 0.47, captionMarginV: null };
+}
+
 // Uploaded video → headline + line under it for the whole video, karaoke captions, 1080x1920.
 async function runPlainAdCompose(body, mainPath, tmpDir, { onProgress, W, H, FPS }) {
   const mainDur = (await ffprobeDuration(mainPath)) || 600;
   onProgress({ stage: "headline", progress: 25, message: "Adding the headline…" });
   const headAss = path.join(tmpDir, "main-head.ass");
-  fs.writeFileSync(headAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "", durationSec: mainDur + 1 }), "utf8");
+  const layout = adTextLayout(body, H);
+  fs.writeFileSync(headAss, buildAdIntroAss({ width: W, height: H, headline: body.headline, subline: body.subline ?? "", durationSec: mainDur + 1, headY: layout.headY }), "utf8");
   const hasAudio = await hasAudioStream(mainPath);
   const headedPath = path.join(tmpDir, "headed.mp4");
   const args = ["-y", "-i", mainPath];
@@ -1596,7 +1604,7 @@ async function runPlainAdCompose(body, mainPath, tmpDir, { onProgress, W, H, FPS
   if (words.length > 0) {
     onProgress({ stage: "burning-captions", progress: 70, message: `Burning ${words.length} caption words…` });
     const assPath = path.join(tmpDir, "captions.ass");
-    fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H, highlightBgr: /^[0-9A-Fa-f]{6}$/.test(body.highlight_bgr || "") ? body.highlight_bgr : "00FFFF" }), "utf8");
+    fs.writeFileSync(assPath, buildKaraokeAss(words, { width: W, height: H, highlightBgr: /^[0-9A-Fa-f]{6}$/.test(body.highlight_bgr || "") ? body.highlight_bgr : "00FFFF", marginVOverride: adTextLayout(body, H).captionMarginV }), "utf8");
     finalPath = path.join(tmpDir, "final.mp4");
     await burnCaptionsIntoVideo(headedPath, finalPath, assPath, words, tmpDir);
   } else if (body.require_captions !== false) {
