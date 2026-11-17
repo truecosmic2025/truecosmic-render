@@ -31,7 +31,9 @@ try {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RENDER_SERVER_VERSION = "2026-11-14-ad-text-position";
+// Keep the "portrait-shorts-narration-end-vNN" tag: Story Weaver's assemble-final-video refuses
+// portrait Shorts unless /health reports v31 or later. Dropping it (7 Nov) blocked every Shorts render.
+const RENDER_SERVER_VERSION = "2026-11-17-portrait-shorts-narration-end-v36-ad-text-position";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
