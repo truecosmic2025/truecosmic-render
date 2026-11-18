@@ -33,7 +33,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 // Keep the "portrait-shorts-narration-end-vNN" tag: Story Weaver's assemble-final-video refuses
 // portrait Shorts unless /health reports v31 or later. Dropping it (7 Nov) blocked every Shorts render.
-const RENDER_SERVER_VERSION = "2026-11-17-portrait-shorts-narration-end-v36-ad-text-position";
+const RENDER_SERVER_VERSION = "2026-11-18-portrait-shorts-narration-end-v37-safari-safe-brand-join";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1639,6 +1639,32 @@ app.post("/avatar-ad-compose", (req, res) => {
 });
 
 // ==========================================================================
+/**
+ * ffmpeg args that join already-normalised clips (same size) into one clean,
+ * Safari-safe MP4: a single H.264 High/4.1 stream with one set of codec
+ * parameters, timestamps starting at zero, and evenly timed 44.1 kHz AAC.
+ */
+function buildBrandJoinArgs(parts, outPath, { width, height }) {
+  const args = ["-y"];
+  for (const p of parts) args.push("-i", p);
+  const prep = parts.map((_, i) =>
+    `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p,setpts=PTS-STARTPTS[v${i}];` +
+    `[${i}:a]aresample=44100:async=1:first_pts=0,aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`
+  ).join(";");
+  const inputs = parts.map((_, i) => `[v${i}][a${i}]`).join("");
+  args.push(
+    "-filter_complex", `${prep};${inputs}concat=n=${parts.length}:v=1:a=1[v][a]`,
+    "-map", "[v]", "-map", "[a]",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+    "-profile:v", "high", "-level:v", "4.1", "-pix_fmt", "yuv420p", "-r", "25",
+    "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+    "-movflags", "+faststart",
+    outPath,
+  );
+  return args;
+}
+
 app.post("/burn-captions-only", async (req, res) => {
   const body = req.body || {};
   const { video_url, upload_url, public_url, target_aspect = "16:9" } = body;
@@ -1778,37 +1804,20 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
         ]);
         return normPath;
       }
-      // Body needs to share the same audio profile so concat demuxer is stable.
-      const bodyNormPath = path.join(tmpDir, "body-norm.mp4");
-      await runFfmpeg([
-        "-y",
-        "-i", burnedPath,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "44100",
-        "-ac", "2",
-        "-movflags", "+faststart",
-        bodyNormPath,
-      ]);
+      // Join intro + captioned body + outro with ONE re-encode through the
+      // concat filter. The old concat-demuxer "-c copy" join glued three
+      // separately encoded H.264 streams together: the result carried one set
+      // of codec parameters for all three, an empty edit at the start and
+      // irregular audio timing. Chrome tolerated it but Safari's player
+      // stalled forever on every branded (long-form) final.
       const parts = [];
       const introUrl = skipPortraitBrandWrap ? null : body.intro_url;
       const outroUrl = skipPortraitBrandWrap ? null : body.outro_url;
       if (introUrl) parts.push(await normalizeBrandClip(introUrl, "intro"));
-      parts.push(bodyNormPath);
+      parts.push(burnedPath);
       if (outroUrl) parts.push(await normalizeBrandClip(outroUrl, "outro"));
-      const brandConcatList = path.join(tmpDir, "brand.ffconcat");
-      fs.writeFileSync(brandConcatList, parts.map(ffconcatLine).join("\n") + "\n", "utf8");
       const brandedPath = path.join(tmpDir, "branded.mp4");
-      await runFfmpeg([
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", brandConcatList,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        brandedPath,
-      ]);
+      await runFfmpeg(buildBrandJoinArgs(parts, brandedPath, { width: W, height: H }));
       finalPath = brandedPath;
       console.log(`Wrapped final video with brand assets: intro=${Boolean(introUrl)}, outro=${Boolean(outroUrl)}`);
     }
