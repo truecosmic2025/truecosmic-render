@@ -33,7 +33,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 // Keep the "portrait-shorts-narration-end-vNN" tag: Story Weaver's assemble-final-video refuses
 // portrait Shorts unless /health reports v31 or later. Dropping it (7 Nov) blocked every Shorts render.
-const RENDER_SERVER_VERSION = "2026-11-18-portrait-shorts-narration-end-v37-safari-safe-brand-join";
+const RENDER_SERVER_VERSION = "2026-11-18-portrait-shorts-narration-end-v38-end-hold";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -1644,14 +1644,27 @@ app.post("/avatar-ad-compose", (req, res) => {
  * Safari-safe MP4: a single H.264 High/4.1 stream with one set of codec
  * parameters, timestamps starting at zero, and evenly timed 44.1 kHz AAC.
  */
-function buildBrandJoinArgs(parts, outPath, { width, height }) {
+function buildBrandJoinArgs(parts, outPath, { width, height, hold = null }) {
   const args = ["-y"];
   for (const p of parts) args.push("-i", p);
-  const prep = parts.map((_, i) =>
-    `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
-    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p,setpts=PTS-STARTPTS[v${i}];` +
-    `[${i}:a]aresample=44100:async=1:first_pts=0,aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`
-  ).join(";");
+  // Optional end hold on one part (the captioned body): freeze its last frame
+  // for hold.seconds, fading picture to black over the final second and the
+  // sound out over its last 0.25 s, so the video doesn't cut away the instant
+  // the last word ends.
+  const holdFor = (i) => hold && hold.index === i && hold.seconds > 0 && hold.baseDuration > 0;
+  const prep = parts.map((_, i) => {
+    let vExtra = "";
+    let aExtra = "";
+    if (holdFor(i)) {
+      const total = hold.baseDuration + hold.seconds;
+      const fadeLen = Math.min(1, hold.seconds);
+      vExtra = `,tpad=stop_mode=clone:stop_duration=${hold.seconds},fade=t=out:st=${(total - fadeLen).toFixed(3)}:d=${fadeLen}`;
+      aExtra = `,afade=t=out:st=${Math.max(0, hold.baseDuration - 0.25).toFixed(3)}:d=0.25,apad=whole_dur=${total.toFixed(3)}`;
+    }
+    return `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p,setpts=PTS-STARTPTS${vExtra}[v${i}];` +
+      `[${i}:a]aresample=44100:async=1:first_pts=0,aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS${aExtra}[a${i}]`;
+  }).join(";");
   const inputs = parts.map((_, i) => `[v${i}][a${i}]`).join("");
   args.push(
     "-filter_complex", `${prep};${inputs}concat=n=${parts.length}:v=1:a=1[v][a]`,
@@ -1814,10 +1827,17 @@ async function runCaptionBurnPipeline(body, videoUrl, uploadUrl, publicUrl, targ
       const introUrl = skipPortraitBrandWrap ? null : body.intro_url;
       const outroUrl = skipPortraitBrandWrap ? null : body.outro_url;
       if (introUrl) parts.push(await normalizeBrandClip(introUrl, "intro"));
+      const bodyIndex = parts.length;
       parts.push(burnedPath);
       if (outroUrl) parts.push(await normalizeBrandClip(outroUrl, "outro"));
       const brandedPath = path.join(tmpDir, "branded.mp4");
-      await runFfmpeg(buildBrandJoinArgs(parts, brandedPath, { width: W, height: H }));
+      // Long-form ends on a 2 s hold (body_end_hold_seconds overrides; 0 disables).
+      const holdSeconds = Number.isFinite(Number(body.body_end_hold_seconds)) ? Math.max(0, Math.min(5, Number(body.body_end_hold_seconds))) : 2;
+      const baseDuration = holdSeconds > 0 ? await ffprobeDuration(burnedPath) : 0;
+      await runFfmpeg(buildBrandJoinArgs(parts, brandedPath, {
+        width: W, height: H,
+        hold: { index: bodyIndex, seconds: holdSeconds, baseDuration },
+      }));
       finalPath = brandedPath;
       console.log(`Wrapped final video with brand assets: intro=${Boolean(introUrl)}, outro=${Boolean(outroUrl)}`);
     }
