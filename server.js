@@ -49,7 +49,7 @@ function narrationJoinFades(offset, target, itemDuration) {
   return parts.length ? "," + parts.join(",") : "";
 }
 
-const RENDER_SERVER_VERSION = "2026-11-19-portrait-shorts-narration-end-v39-smooth-joins";
+const RENDER_SERVER_VERSION = "2026-11-19-portrait-shorts-narration-end-v40-landscape-end-tail";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -2087,6 +2087,15 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       const lastIdx = clipTargetDurations.length - 1;
       clipTargetDurations[lastIdx] = (Number(clipTargetDurations[lastIdx]) || 0) + endTail;
     }
+    // Long-form landscape: the last scene stays on screen a few seconds after the
+    // final word while the music carries on and fades out, so the ending breathes
+    // instead of cutting straight to the outro.
+    let landscapeEndTail = 0;
+    if (!isShortPortrait && target_aspect !== "9:16" && body.shorts_mode !== true && clipTargetDurations.length > 0) {
+      landscapeEndTail = clampNumber(body.end_tail_seconds, 3.5, 0, 8);
+      const lastIdx = clipTargetDurations.length - 1;
+      clipTargetDurations[lastIdx] = (Number(clipTargetDurations[lastIdx]) || 0) + landscapeEndTail;
+    }
     const syncedTotalDuration = clipTargetDurations.reduce((s, d) => s + d, 0);
     const baseTotalDuration = syncedTotalDuration;
 
@@ -2233,7 +2242,7 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
     }
     if (musicPath) {
       mixInputs.push("-i", musicPath);
-      audioParts.push(`[${inputIdx}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,aloop=loop=-1:size=2147483647,asetpts=N/SR/TB,volume=${musicVolume}[music]`);
+      audioParts.push(`[${inputIdx}:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,aloop=loop=-1:size=2147483647,asetpts=N/SR/TB,volume=${musicVolume}${landscapeEndTail > 0 ? `,afade=t=out:st=${Math.max(0, finalDuration - landscapeEndTail).toFixed(3)}:d=${landscapeEndTail.toFixed(3)}` : ""}[music]`);
       audioLabels.push("[music]");
       inputIdx++;
     }
