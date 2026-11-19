@@ -33,7 +33,23 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 // Keep the "portrait-shorts-narration-end-vNN" tag: Story Weaver's assemble-final-video refuses
 // portrait Shorts unless /health reports v31 or later. Dropping it (7 Nov) blocked every Shorts render.
-const RENDER_SERVER_VERSION = "2026-11-18-portrait-shorts-narration-end-v38-end-hold";
+// Tiny fades where a narration clip starts and ends, so each clip's first and last
+// samples don't jump from/to silence (the "pop" between scenes). A clip split
+// across two scenes keeps its middle untouched.
+const NARRATION_FADE_IN_SECONDS = 0.008;
+const NARRATION_FADE_OUT_SECONDS = 0.015;
+function narrationJoinFades(offset, target, itemDuration) {
+  const parts = [];
+  if (offset <= 0.001) parts.push(`afade=t=in:st=0:d=${NARRATION_FADE_IN_SECONDS}`);
+  const remaining = itemDuration > 0 ? itemDuration - offset : 0;
+  if (remaining > 0 && remaining <= target + 0.05) {
+    const end = Math.min(remaining, target);
+    parts.push(`afade=t=out:st=${Math.max(0, end - NARRATION_FADE_OUT_SECONDS).toFixed(4)}:d=${NARRATION_FADE_OUT_SECONDS}`);
+  }
+  return parts.length ? "," + parts.join(",") : "";
+}
+
+const RENDER_SERVER_VERSION = "2026-11-19-portrait-shorts-narration-end-v39-smooth-joins";
 const FFMPEG_BIN = resolveFfmpegBinary();
 const FFPROBE_BIN = resolveFfprobeBinary();
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
@@ -2085,7 +2101,9 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
       onProgress({ stage: "syncing-audio", progress: 35, message: "Aligning narration to scene timings…" });
       for (let i = 0; i < localPaths.length; i++) {
         const target = Math.max(0.5, Number(clipTargetDurations[i]) || 0.5);
-        const segmentPath = path.join(tmpDir, `narration-segment-${String(i).padStart(4, "0")}.m4a`);
+        // Segments are joined as uncompressed WAV and encoded to AAC once: separately
+        // encoded AAC pieces each carry encoder padding, which clicks at every join.
+        const segmentPath = path.join(tmpDir, `narration-segment-${String(i).padStart(4, "0")}.wav`);
         const sceneNumber = clipSceneNumbers[i];
         const item = byScene.get(sceneNumber);
         const offset = offsetsByScene.get(sceneNumber) || 0;
@@ -2095,10 +2113,9 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
           await runFfmpeg([
             "-y",
             "-i", item.path,
-            "-filter_complex", `[0:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=${offset.toFixed(3)}:duration=${target.toFixed(3)},apad,atrim=duration=${target.toFixed(3)},asetpts=N/SR/TB[a]`,
+            "-filter_complex", `[0:a]aresample=44100,aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=${offset.toFixed(3)}:duration=${target.toFixed(3)},asetpts=N/SR/TB${narrationJoinFades(offset, target, itemDuration)},apad,atrim=duration=${target.toFixed(3)},asetpts=N/SR/TB[a]`,
             "-map", "[a]",
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-c:a", "pcm_s16le",
             segmentPath,
           ]);
         } else {
@@ -2106,8 +2123,7 @@ async function runStitchPipeline(body, clipUrls, target_aspect, output_filename,
             "-y",
             "-f", "lavfi",
             "-i", `anullsrc=channel_layout=stereo:sample_rate=44100:d=${target.toFixed(3)}`,
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-c:a", "pcm_s16le",
             segmentPath,
           ]);
         }
